@@ -1,0 +1,190 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Skein Canvas</title>
+<style>
+body { font-family: sans-serif; margin: 0; display: flex; height: 100vh; }
+#main { flex: 3; overflow: auto; background: #f7f7f7; }
+#side { flex: 1; min-width: 320px; border-left: 1px solid #ccc; padding: 12px; overflow: auto; }
+header { padding: 8px 12px; background: #222; color: #fff; display: flex; gap: 12px; align-items: center; }
+header button { cursor: pointer; }
+.node { cursor: pointer; }
+.node rect { stroke-width: 2; }
+.node text { font-size: 12px; }
+pre.ev { background: #eee; padding: 6px; max-height: 160px; overflow: auto; font-size: 11px; }
+label { display: block; margin-top: 6px; font-size: 12px; }
+input, textarea, select { width: 100%; box-sizing: border-box; }
+.row { display: flex; gap: 6px; margin-top: 8px; }
+</style>
+</head>
+<body>
+<div style="display:flex;flex-direction:column;width:100%">
+<header>
+<strong>Skein Canvas</strong>
+<span id="meta"></span>
+<button onclick="toggleAdd()">+ node</button>
+<button onclick="refresh(true)">refresh</button>
+</header>
+<div style="display:flex;flex:1;min-height:0">
+<div id="main"><svg id="graph" width="1200" height="800"></svg></div>
+<div id="side"><div id="detail"><em>Select a node.</em></div></div>
+</div>
+</div>
+<script>
+const COLORS = {unclaimed:"#999", claimed:"#1f77b4", in_progress:"#1f77b4",
+  blocked:"#9467bd", needs_human:"#ff7f0e", done:"#2ca02c", failed:"#d62728"};
+let NODES = {}, EVENT_COUNT = 0, SELECTED = null;
+
+async function api(method, path, body) {
+  const r = await fetch(path, {method, headers: {"Content-Type": "application/json"},
+    body: body ? JSON.stringify(body) : undefined});
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(data.error || ("HTTP " + r.status));
+  return data;
+}
+
+function depth(id, seen) {
+  seen = seen || {};
+  if (seen[id]) return 0;
+  seen[id] = 1;
+  const n = NODES[id];
+  if (!n || !n.depends_on.length) return 0;
+  return 1 + Math.max.apply(null, n.depends_on.map(d => depth(d, Object.assign({}, seen))));
+}
+
+function render() {
+  const svg = document.getElementById("graph");
+  while (svg.firstChild) svg.removeChild(svg.firstChild);
+  const ids = Object.keys(NODES);
+  const layers = {};
+  ids.forEach(id => { const d = depth(id); (layers[d] = layers[d] || []).push(id); });
+  const pos = {};
+  Object.keys(layers).sort((a, b) => a - b).forEach(d => {
+    layers[d].sort().forEach((id, i) => { pos[id] = {x: 100 + d * 240, y: 60 + i * 100}; });
+  });
+  const NS = "http://www.w3.org/2000/svg";
+  ids.forEach(id => {
+    (NODES[id].depends_on || []).forEach(dep => {
+      if (!pos[dep]) return;
+      const l = document.createElementNS(NS, "line");
+      l.setAttribute("x1", pos[dep].x + 90); l.setAttribute("y1", pos[dep].y);
+      l.setAttribute("x2", pos[id].x - 90); l.setAttribute("y2", pos[id].y);
+      l.setAttribute("stroke", "#888"); l.setAttribute("marker-end", "url(#arr)");
+      svg.appendChild(l);
+    });
+  });
+  const defs = document.createElementNS(NS, "defs");
+  defs.innerHTML = '<marker id="arr" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8" fill="none" stroke="#888"/></marker>';
+  svg.appendChild(defs);
+  ids.sort().forEach(id => {
+    const n = NODES[id], p = pos[id];
+    const gEl = document.createElementNS(NS, "g");
+    gEl.setAttribute("class", "node");
+    gEl.setAttribute("transform", "translate(" + p.x + "," + p.y + ")");
+    const color = COLORS[n.status] || "#999";
+    gEl.innerHTML = '<rect x="-90" y="-26" width="180" height="52" rx="6" fill="#fff" stroke="' + color + '"' +
+      (SELECTED === id ? ' stroke-width="4"' : '') + '/>' +
+      '<text text-anchor="middle" y="-6"><tspan font-weight="bold">' + esc(id) + '</tspan></text>' +
+      '<text text-anchor="middle" y="10">' + esc((n.title || "").slice(0, 26)) + '</text>' +
+      '<text text-anchor="middle" y="24" fill="' + color + '">' + esc(n.status) + '</text>';
+    gEl.onclick = () => { SELECTED = id; render(); showDetail(id); };
+    svg.appendChild(gEl);
+  });
+  const maxY = Math.max.apply(null, [400].concat(ids.map(id => pos[id].y + 80)));
+  const maxX = Math.max.apply(null, [800].concat(ids.map(id => pos[id].x + 160)));
+  svg.setAttribute("height", maxY); svg.setAttribute("width", maxX);
+}
+
+function esc(s) { return String(s == null ? "" : s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;"); }
+
+function showDetail(id) {
+  const n = NODES[id];
+  const el = document.getElementById("detail");
+  const it = n.intent || {};
+  const ev = (n.evidence || []).map(e => esc(e.command) + " -> exit " + e.exit_code).join("\n");
+  el.innerHTML =
+    "<h3>" + esc(id) + "</h3>" +
+    "<div>Status: <b>" + esc(n.status) + "</b> backend: " + esc(n.backend || "") + "</div>" +
+    "<div>Depends: " + esc((n.depends_on || []).join(", ")) + "</div>" +
+    "<div>Holder: " + esc((n.claim || {}).holder || "-") + "</div>" +
+    "<p><b>Goal:</b> " + esc(it.goal || "") + "</p>" +
+    "<p><b>Handoff:</b> " + esc(n.handoff_note || "-") + "</p>" +
+    "<pre class='ev'>" + ev + "</pre>" +
+    "<label>Title <input id='f-title' value='" + esc(n.title || "").replace(/'/g, "&#39;") + "'></label>" +
+    "<label>Goal <textarea id='f-goal' rows='2'>" + esc(it.goal || "") + "</textarea></label>" +
+    "<label>Completion <input id='f-completion' value='" + esc(it.completion || "").replace(/'/g, "&#39;") + "'></label>" +
+    "<label>Status <select id='f-status'>" +
+    ["unclaimed","claimed","in_progress","blocked","needs_human","done","failed"].map(s =>
+      "<option value='" + s + "'" + (n.status === s ? " selected" : "") + ">" + s + "</option>").join("") +
+    "</select></label>" +
+    "<div class='row'><button onclick='saveEdit()'>save</button>" +
+    "<button onclick='claimNode()'>claim</button>" +
+    "<button onclick='releaseNode(false)'>release</button>" +
+    "<button onclick='releaseNode(true)'>force</button>" +
+    "<button onclick='deleteNode()'>delete</button></div>" +
+    "<div id='msg'></div>";
+}
+
+function val(id) { return document.getElementById(id).value; }
+function msg(t) { document.getElementById("msg").textContent = t; }
+
+async function saveEdit() {
+  try {
+    const r = await api("POST", "/api/nodes/" + encodeURIComponent(SELECTED), {
+      title: val("f-title"),
+      intent: {goal: val("f-goal"), completion: val("f-completion")},
+      status: val("f-status")});
+    msg(r.outcome === "interrupt" ? "human_interrupt recorded; agent claim parked." : "saved.");
+    await refresh(true);
+  } catch (e) { msg("error: " + e.message); }
+}
+async function claimNode() {
+  const holder = prompt("holder id:", "web") || "web";
+  try { await api("POST", "/api/nodes/" + encodeURIComponent(SELECTED) + "/claim", {holder}); await refresh(true); }
+  catch (e) { msg("error: " + e.message); }
+}
+async function releaseNode(force) {
+  try { await api("POST", "/api/nodes/" + encodeURIComponent(SELECTED) + "/release", {force}); await refresh(true); }
+  catch (e) { msg("error: " + e.message); }
+}
+async function deleteNode() {
+  if (!confirm("Delete " + SELECTED + "?")) return;
+  try {
+    const r = await api("POST", "/api/nodes/" + encodeURIComponent(SELECTED), {delete: true});
+    msg(r.outcome === "interrupt_delete" ? "human_interrupt (delete) recorded." : "removed.");
+    SELECTED = null; await refresh(true);
+  } catch (e) { msg("error: " + e.message); }
+}
+function toggleAdd() {
+  const el = document.getElementById("detail");
+  el.innerHTML = "<h3>New node</h3>" +
+    "<label>ID <input id='a-id'></label><label>Title <input id='a-title'></label>" +
+    "<label>Goal <textarea id='a-goal' rows='2'></textarea></label>" +
+    "<label>Completion <input id='a-completion'></label>" +
+    "<label>Depends (csv) <input id='a-dep'></label>" +
+    "<label>Backend <input id='a-backend' value='claude_code'></label>" +
+    "<div class='row'><button onclick='addNode()'>add</button></div><div id='msg'></div>";
+}
+async function addNode() {
+  const csv = s => val(s).split(",").map(x => x.trim()).filter(Boolean);
+  try {
+    await api("POST", "/api/nodes", {id: val("a-id"), title: val("a-title"),
+      goal: val("a-goal"), completion: val("a-completion"),
+      depends_on: csv("a-dep"), backend: val("a-backend")});
+    await refresh(true);
+  } catch (e) { msg("error: " + e.message); }
+}
+
+async function refresh(force) {
+  const g = await api("GET", "/api/graph");
+  NODES = g.nodes; EVENT_COUNT = g.event_count;
+  document.getElementById("meta").textContent = Object.keys(NODES).length + " nodes, " + EVENT_COUNT + " events";
+  render();
+  if (SELECTED && NODES[SELECTED]) showDetail(SELECTED);
+}
+setInterval(() => refresh(false).catch(() => {}), 2000);
+refresh(true);
+</script>
+</body>
+</html>

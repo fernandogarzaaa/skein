@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "skein"
+version = "0.2.0"
+description = "Parallel task-graph orchestration for coding agents with git worktrees"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = []
+
+[project.optional-dependencies]
+test = ["pytest>=7"]
+
+[project.scripts]
+skein = "skein.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+skein = ["static/*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
