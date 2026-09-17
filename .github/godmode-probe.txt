@@ -1,3 +1,0 @@
-GodMode auto-update probe (2026-09-17): this file's push to main should fire
-notify-godmode → repository_dispatch(source-updated) → godmode auto-update → sync PR.
-Safe to delete after the loop is verified.
