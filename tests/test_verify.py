@@ -1,8 +1,10 @@
 """Stage 4: verification gate tests (real command execution)."""
 
+import sys
+
 from skein import verify as v
 
-PY = "python"
+PY = sys.executable
 
 
 def test_passing_completion(tmp_path):
