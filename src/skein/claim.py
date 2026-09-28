@@ -17,8 +17,9 @@ machine (a true local CAS). Git sync across machines stays eventual.
 from __future__ import annotations
 
 import fnmatch
+import random
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path, PurePosixPath
 from typing import Dict, List, Optional, Tuple
 
@@ -98,6 +99,13 @@ def eligibility(repo_root: str | Path, node_id: str) -> Tuple[bool, str]:
         return False, f"node '{node_id}' has been removed"
     if node["status"] != "unclaimed":
         return False, f"node '{node_id}' status is '{node['status']}', expected 'unclaimed'"
+    # Retry backoff gate: a failed attempt parks the node as unclaimed
+    # with retry_at set; it becomes claimable again once the deadline
+    # passes. Tests set retry_at in the past (or mock now_utc) instead
+    # of sleeping.
+    retry_at = parse_ts(node.get("retry_at"))
+    if retry_at is not None and now_utc() < retry_at:
+        return False, f"backoff until {retry_at.isoformat()}"
     for dep in node.get("depends_on", []):
         d = nodes.get(dep)
         if d is None or d.get("removed"):
@@ -168,7 +176,6 @@ def claim_node(repo_root: str | Path, node_id: str, holder: str,
                ttl_seconds: Optional[int] = None,
                expected_version: Optional[int] = None,
                actor: Optional[str] = None,
-               max_retries: int = 3,
                worker_id: Optional[str] = None) -> Dict:
     """Atomic compare-and-swap claim under the control-plane lock.
 
@@ -302,11 +309,36 @@ def complete_node(repo_root: str | Path, node_id: str, actor: str,
         return g.load_graph(repo_root)[node_id]
 
 
+def _backoff_with_jitter(base_seconds: float, failures_used: int) -> float:
+    """Exponential backoff with +/-25% jitter: base * 2**failures_used.
+
+    failures_used counts failures already consumed (0 for the first
+    retry), so the first backoff is ~base, the next ~2*base, and so on.
+    The jittered value is computed once at fail time and recorded on
+    the failed event, so reduce stays deterministic.
+    """
+    base = max(0.0, float(base_seconds))
+    return base * (2 ** max(0, failures_used)) * random.uniform(0.75, 1.25)
+
+
 def fail_node(repo_root: str | Path, node_id: str, actor: str,
               claim_token: str,
               evidence: Optional[List[Dict]] = None,
-              error: str = "") -> Dict:
-    """Fenced failure: only the current attempt's token can mark failed."""
+              error: str = "",
+              outcome: str = "failed") -> Dict:
+    """Fenced failure: only the current attempt's token can mark failed.
+
+    Retryable failures (backend failure, timeout, verification failure)
+    do NOT park the node at failed while retries remain: the node goes
+    back to unclaimed with retry_at set to now + backoff, and the
+    attempt is appended to the node's attempt history. Only when
+    failures_used reaches max_retries does the node park at failed.
+    Human interrupts and claim-token violations never reach this path:
+    interrupts park at needs_human via human_interrupt, and stale
+    tokens are rejected by the fence above.
+    """
+    if outcome not in ("failed", "timeout"):
+        raise ClaimError(f"unknown failure outcome '{outcome}'")
     with locks.repo_lock(repo_root):
         nodes = g.load_graph(repo_root)
         node = nodes.get(node_id)
@@ -316,11 +348,31 @@ def fail_node(repo_root: str | Path, node_id: str, actor: str,
             raise ClaimError(
                 f"node '{node_id}' status '{node['status']}' cannot fail")
         claim = _check_fence(node, node_id, claim_token, "fail")
+        attempts = node.get("attempts") or []
+        failures_used = sum(1 for a in attempts
+                            if a.get("outcome") in g.RETRYABLE_OUTCOMES)
+        max_retries = node.get("max_retries", g.DEFAULT_MAX_RETRIES)
+        try:
+            max_retries = int(max_retries)
+        except (TypeError, ValueError):
+            max_retries = g.DEFAULT_MAX_RETRIES
+        retry = failures_used < max(0, max_retries)
+        backoff = _backoff_with_jitter(
+            node.get("retry_backoff_seconds",
+                     g.DEFAULT_RETRY_BACKOFF_SECONDS),
+            failures_used) if retry else 0.0
+        retry_at = (now_utc() + timedelta(seconds=backoff)).isoformat() \
+            if retry else None
         g.append_event(repo_root, actor, "failed", node_id, {
             "evidence": evidence or [],
             "error": error,
+            "outcome": outcome,
             "attempt_id": claim.get("attempt_id"),
             "claim_token": claim_token,
+            "retry": retry,
+            "retry_at": retry_at,
+            "attempts_used": failures_used,
+            "backoff_seconds": backoff,
         })
         return g.load_graph(repo_root)[node_id]
 

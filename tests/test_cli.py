@@ -81,6 +81,7 @@ def test_end_to_end_run_real_worktree_branch_evidence(repo):
 def test_run_failing_completion_ends_failed(repo):
     from skein.supervisor import run_node
     assert skein_main(["node", "add", "n2", "--title", "T", "--goal", "g",
+                       "--max-retries", "0",
                        "--completion", f"{PY} -c \"raise SystemExit(1)\""]) == 0
     adapter = FakeAdapter("pass")
     result = run_node(repo, "n2", "agent-1", adapter=adapter,

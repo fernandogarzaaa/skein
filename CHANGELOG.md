@@ -1,5 +1,42 @@
 # Changelog
 
+## Unreleased (Phase 4: scheduler and retries)
+
+- Per-node retry policy: `skein node add --max-retries N
+  --retry-backoff-seconds S` stores the policy on the node
+  (`default_max_retries` / `default_retry_backoff_seconds` from
+  config.json when omitted; 0 means no retries). Editable via
+  `skein node edit` and through the web API (same validation as the
+  CLI). The previously dead `claim_node(max_retries=...)` parameter is
+  removed; the policy lives on the node record, not the claim call.
+- Retryable failure: `fail_node` parks the node at `unclaimed` with
+  `retry_at` set to now + backoff while failures used are below
+  `max_retries`; only exhausted retries park at `failed`. Backoff is
+  exponential (base * 2^failures, +/-25% jitter), computed once at fail
+  time and recorded on the failed event so reduction stays
+  deterministic. Timeouts (exit 124) and verification failures retry;
+  human interrupts and stale-token violations never reach the fail
+  path. `eligibility()` reports "backoff until <ts>" while the deadline
+  is in the future.
+- First-class attempt history: every claim -> outcome cycle appends an
+  entry (attempt_id, holder, started_at, ended_at, outcome, error) to
+  `node["attempts"]`, derived entirely in `reduce_events` and bounded
+  to the last 20 entries. Outcomes recorded: done, failed, timeout,
+  released, reaped, interrupted.
+- `skein run --all`: multi-node scheduler loop. Each pass claims and
+  runs up to `--max-parallel` eligible nodes sequentially in one
+  process (default 2), re-scans, and stops when no eligible nodes
+  remain or `--max-nodes` is hit. When nodes are only waiting out a
+  retry backoff, the scheduler waits for the earliest deadline instead
+  of dropping the retries. Ends with a node/outcome/attempts summary
+  table plus a not-run list with reasons. Exit codes mirror single
+  runs: 0 ok, 2 failed, 3 interrupted.
+- `skein status` shows retry state: a TRIES column with the attempt
+  count, and `backoff Ns` / `retry due` in the lease column for nodes
+  waiting out a backoff. The web `/api/graph` payload carries the same
+  fields (`max_retries`, `retry_backoff_seconds`, `retry_at`,
+  `attempts_used`, `attempts`).
+
 ## Unreleased (Phase 3: worktree and result-commit model)
 
 - Node deletion owns the worktree lifecycle: `skein node delete <id>`

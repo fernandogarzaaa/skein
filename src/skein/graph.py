@@ -76,7 +76,8 @@ def config_path(repo_root: str | Path) -> Path:
 
 
 def default_config() -> Dict[str, Any]:
-    return {"default_ttl_seconds": 1800, "heartbeat_interval_seconds": 60}
+    return {"default_ttl_seconds": 1800, "heartbeat_interval_seconds": 60,
+            "default_max_retries": 3, "default_retry_backoff_seconds": 60}
 
 
 def load_config(repo_root: str | Path) -> Dict[str, Any]:
@@ -86,13 +87,50 @@ def load_config(repo_root: str | Path) -> Dict[str, Any]:
     return default_config()
 
 
+# Retry policy fallbacks for nodes that predate the retry fields (their
+# node_added payloads carry no policy, so reduce cannot consult config).
+DEFAULT_MAX_RETRIES = 3
+DEFAULT_RETRY_BACKOFF_SECONDS = 60.0
+
+# Attempt outcomes that consume one retry from the node's policy.
+RETRYABLE_OUTCOMES = frozenset({"failed", "timeout"})
+
+# Cap on stored attempt history per node: append-only, but bounded so a
+# hot node cannot grow the log-derived graph without limit.
+MAX_ATTEMPT_HISTORY = 20
+
+
+def _coerce_max_retries(value: Any, fallback: int = DEFAULT_MAX_RETRIES) -> int:
+    try:
+        v = int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return fallback
+    try:
+        if float(value) != v:  # reject 2.5-style fractional input
+            return fallback
+    except (TypeError, ValueError):
+        return fallback
+    return v if v >= 0 else fallback
+
+
+def _coerce_backoff(value: Any,
+                    fallback: float = DEFAULT_RETRY_BACKOFF_SECONDS) -> float:
+    try:
+        v = float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return fallback
+    return v if v >= 0 else fallback
+
+
 def new_node(node_id: str, title: str = "", intent: Optional[Dict[str, str]] = None,
              depends_on: Optional[List[str]] = None,
              blast_radius: Optional[List[str]] = None,
              backend: str = "claude_code",
              backend_config: Optional[Dict[str, str]] = None,
              change_policy: str = "warn",
-             integration_for: Optional[str] = None) -> Dict[str, Any]:
+             integration_for: Optional[str] = None,
+             max_retries: Optional[int] = None,
+             retry_backoff_seconds: Optional[float] = None) -> Dict[str, Any]:
     return {
         "id": node_id,
         "title": title,
@@ -107,6 +145,21 @@ def new_node(node_id: str, title: str = "", intent: Optional[Dict[str, str]] = N
         # parents of `integration_for` and are themselves exempt from the
         # integration gate in claim eligibility.
         "integration_for": integration_for,
+        # retry policy: max_retries is the number of retries AFTER the
+        # initial attempt (0 = no retries). Backoff between attempts is
+        # exponential: base * 2**failures_used, with jitter, computed at
+        # fail time and recorded on the failed event.
+        "max_retries": _coerce_max_retries(max_retries),
+        "retry_backoff_seconds": _coerce_backoff(retry_backoff_seconds),
+        # set while a failed attempt is waiting out its backoff; cleared
+        # on claim and on release
+        "retry_at": None,
+        # failures consumed so far (informational; the authoritative count
+        # is derived from the attempt history below)
+        "attempts_used": 0,
+        # append-only history of claim -> outcome cycles, bounded to the
+        # last MAX_ATTEMPT_HISTORY entries
+        "attempts": [],
         "claim": {"holder": None, "attempt_id": None, "claim_token": None,
                   "worker_id": None, "node_version": None, "base_branch": None,
                   "claimed_at": None, "ttl_seconds": None, "last_heartbeat": None},
@@ -326,6 +379,37 @@ def _empty_claim() -> Dict[str, Any]:
             "claimed_at": None, "ttl_seconds": None, "last_heartbeat": None}
 
 
+def _record_attempt(nodes: Dict[str, Dict[str, Any]], nid: str,
+                    ev: Dict[str, Any], outcome: str, error: str) -> None:
+    """Append one claim -> outcome entry to the node's attempt history.
+
+    The entry is built from the node's live claim record plus the event
+    that ended the attempt, so the history is fully derived from the
+    log. Append-only and bounded to the last MAX_ATTEMPT_HISTORY
+    entries. No-ops when there is no live attempt to record (e.g. a
+    release of an already-idle node).
+    """
+    node = nodes.get(nid)
+    if node is None:
+        return
+    claim = node.get("claim") or {}
+    payload = ev.get("payload") or {}
+    attempt_id = claim.get("attempt_id") or payload.get("attempt_id")
+    if not attempt_id:
+        return
+    entry = {
+        "attempt_id": attempt_id,
+        "holder": claim.get("holder") or payload.get("holder"),
+        "started_at": claim.get("claimed_at"),
+        "ended_at": ev.get("timestamp"),
+        "outcome": outcome,
+        "error": (error or "")[:500],
+    }
+    attempts = node.get("attempts") or []
+    node["attempts"] = (attempts[-(MAX_ATTEMPT_HISTORY - 1):] + [entry]
+                        if attempts else [entry])
+
+
 def apply_event(nodes: Dict[str, Dict[str, Any]], ev: Dict[str, Any]) -> None:
     etype = ev.get("type")
     nid = ev.get("node_id")
@@ -344,6 +428,8 @@ def apply_event(nodes: Dict[str, Dict[str, Any]], ev: Dict[str, Any]) -> None:
             backend_config=payload.get("backend_config"),
             change_policy=payload.get("change_policy", "warn"),
             integration_for=payload.get("integration_for"),
+            max_retries=payload.get("max_retries"),
+            retry_backoff_seconds=payload.get("retry_backoff_seconds"),
         )
         node["version"] = (nodes[nid]["version"] + 1) if nid in nodes else 1
         nodes[nid] = node
@@ -357,6 +443,17 @@ def apply_event(nodes: Dict[str, Dict[str, Any]], ev: Dict[str, Any]) -> None:
                 node[key] = deepcopy(payload[key])
         if node.get("change_policy") not in CHANGE_POLICIES:
             node["change_policy"] = "warn"
+        # retry policy edits are applied defensively: a hand-crafted or
+        # synced event with a bad value falls back instead of poisoning
+        # the node record
+        if "max_retries" in payload:
+            node["max_retries"] = _coerce_max_retries(
+                payload.get("max_retries"), node.get("max_retries",
+                                                     DEFAULT_MAX_RETRIES))
+        if "retry_backoff_seconds" in payload:
+            node["retry_backoff_seconds"] = _coerce_backoff(
+                payload.get("retry_backoff_seconds"),
+                node.get("retry_backoff_seconds", DEFAULT_RETRY_BACKOFF_SECONDS))
         if "intent" in payload and isinstance(payload["intent"], dict):
             for k, v in payload["intent"].items():
                 node["intent"][k] = v
@@ -375,6 +472,8 @@ def apply_event(nodes: Dict[str, Dict[str, Any]], ev: Dict[str, Any]) -> None:
         if node is None or node.get("removed"):
             return
         node["status"] = "claimed"
+        # a fresh claim consumes the pending backoff, if any
+        node["retry_at"] = None
         node["claim"] = {
             "holder": payload.get("holder"),
             "attempt_id": payload.get("attempt_id"),
@@ -412,7 +511,11 @@ def apply_event(nodes: Dict[str, Dict[str, Any]], ev: Dict[str, Any]) -> None:
         live_attempt = (node.get("claim") or {}).get("attempt_id")
         if reaped and live_attempt and reaped != live_attempt:
             return
+        _record_attempt(nodes, nid, ev,
+                        "reaped" if payload.get("expired") else "released",
+                        payload.get("note") or "")
         node["status"] = "unclaimed"
+        node["retry_at"] = None
         note = payload.get("note")
         if note:
             # stash previous-attempt context on the node for next claimant
@@ -427,7 +530,9 @@ def apply_event(nodes: Dict[str, Dict[str, Any]], ev: Dict[str, Any]) -> None:
         node = nodes.get(nid)
         if node is None or node.get("removed"):
             return
+        _record_attempt(nodes, nid, ev, "done", "")
         node["status"] = "done"
+        node["retry_at"] = None
         if "handoff_note" in payload:
             node["handoff_note"] = payload["handoff_note"]
         if "evidence" in payload:
@@ -443,11 +548,25 @@ def apply_event(nodes: Dict[str, Dict[str, Any]], ev: Dict[str, Any]) -> None:
         node = nodes.get(nid)
         if node is None or node.get("removed"):
             return
-        node["status"] = "failed"
+        outcome = payload.get("outcome") or "failed"
+        _record_attempt(nodes, nid, ev, outcome, payload.get("error") or "")
+        try:
+            node["attempts_used"] = int(payload.get("attempts_used") or 0)
+        except (TypeError, ValueError):
+            node["attempts_used"] = 0
         if "evidence" in payload:
             node["evidence"] = deepcopy(payload["evidence"])
         if "error" in payload and payload["error"]:
             node["handoff_note"] = payload["error"]
+        # Retryable failure with retries left: park as unclaimed with a
+        # backoff deadline instead of terminally failed. Retries
+        # exhausted (or a legacy event with no retry decision): failed.
+        if payload.get("retry") and payload.get("retry_at"):
+            node["status"] = "unclaimed"
+            node["retry_at"] = payload["retry_at"]
+        else:
+            node["status"] = "failed"
+            node["retry_at"] = None
         node["claim"] = _empty_claim()
         node["version"] += 1
     elif etype == "human_interrupt":
@@ -456,6 +575,12 @@ def apply_event(nodes: Dict[str, Dict[str, Any]], ev: Dict[str, Any]) -> None:
             return
         action = payload.get("action", "edit")
         if action == "delete":
+            # a claimed node deleted by a human still had a live attempt;
+            # record its interruption before the node is removed
+            if node["status"] in ("claimed", "in_progress"):
+                _record_attempt(nodes, nid, ev, "interrupted",
+                                payload.get("reason") or "")
+                node["retry_at"] = None
             node["removed"] = True
         elif action in ("edit", "reassign"):
             # edits carried in payload.fields. NOTE: a human_interrupt never
@@ -474,11 +599,17 @@ def apply_event(nodes: Dict[str, Dict[str, Any]], ev: Dict[str, Any]) -> None:
                     node["intent"][k] = v
             # an interrupt targeting a claimed node parks it for human review
             if node["status"] in ("claimed", "in_progress"):
+                _record_attempt(nodes, nid, ev, "interrupted",
+                                payload.get("reason") or "")
                 node["status"] = "needs_human"
+                node["retry_at"] = None
                 node["claim"] = _empty_claim()
         else:
             if node["status"] in ("claimed", "in_progress"):
+                _record_attempt(nodes, nid, ev, "interrupted",
+                                payload.get("reason") or "")
                 node["status"] = "needs_human"
+                node["retry_at"] = None
                 node["claim"] = _empty_claim()
         node["version"] += 1
 

@@ -100,7 +100,9 @@ class _Handler(BaseHTTPRequestHandler):
                     blast_radius=body.get("blast_radius", []),
                     backend=str(body.get("backend", "claude_code")),
                     backend_config=body.get("backend_config", {}),
-                    change_policy=str(body.get("change_policy", "warn")))
+                    change_policy=str(body.get("change_policy", "warn")),
+                    max_retries=body.get("max_retries"),
+                    retry_backoff_seconds=body.get("retry_backoff_seconds"))
             except ValueError as e:
                 return self._send(400, {"error": str(e)})
             return self._send(201, {"node": node})
@@ -135,7 +137,8 @@ class _Handler(BaseHTTPRequestHandler):
                 fields = {k: v for k, v in body.items()
                           if k in ("title", "intent", "depends_on", "blast_radius",
                                    "status", "backend", "backend_config",
-                                   "change_policy") and k != "actor"}
+                                   "change_policy", "max_retries",
+                                   "retry_backoff_seconds") and k != "actor"}
                 try:
                     outcome = edit_node(self._root, actor, node_id, fields,
                                         delete=bool(body.get("delete", False)))

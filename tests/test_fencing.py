@@ -342,7 +342,7 @@ def test_run_records_durable_result_commit(repo):
 def test_strict_change_policy_fails_out_of_scope_changes(repo):
     from skein.supervisor import run_node
     assert skein_main(["node", "add", "n1", "--blast-radius", "src/allowed/",
-                       "--change-policy", "strict",
+                       "--change-policy", "strict", "--max-retries", "0",
                        "--completion", "true"]) == 0
     adapter = FakeAdapter("open('elsewhere.txt','w').write('oops')")
     result = run_node(repo, "n1", "agent-1", adapter=adapter,

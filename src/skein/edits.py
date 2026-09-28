@@ -76,6 +76,34 @@ def _check_change_policy(policy: str) -> str:
     return policy
 
 
+def _check_max_retries(value) -> int:
+    try:
+        v = int(value)
+        integral = float(value) == v
+    except (TypeError, ValueError):
+        integral = False
+        v = -1
+    if not integral or v < 0:
+        raise ValueError(
+            f"invalid max_retries {value!r}: expected a non-negative integer "
+            f"(0 = no retries)")
+    return v
+
+
+def _check_retry_backoff(value) -> float:
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        raise ValueError(
+            f"invalid retry_backoff_seconds {value!r}: expected a "
+            f"non-negative number of seconds")
+    if v < 0:
+        raise ValueError(
+            f"invalid retry_backoff_seconds {value!r}: expected a "
+            f"non-negative number of seconds")
+    return v
+
+
 def add_node(repo_root: Any, actor: str, node_id: str, *,
              title: str = "",
              goal: str = "", context: str = "", constraints: str = "",
@@ -84,7 +112,9 @@ def add_node(repo_root: Any, actor: str, node_id: str, *,
              blast_radius: Optional[List[str]] = None,
              backend: str = "claude_code",
              backend_config: Optional[Dict[str, str]] = None,
-             change_policy: str = "warn") -> Dict[str, Any]:
+             change_policy: str = "warn",
+             max_retries: Optional[int] = None,
+             retry_backoff_seconds: Optional[float] = None) -> Dict[str, Any]:
     ids.validate_node_id(node_id)
     nodes = g.load_graph(repo_root)
     if node_id in nodes:
@@ -97,6 +127,15 @@ def add_node(repo_root: Any, actor: str, node_id: str, *,
     _check_no_cycles(nodes, node_id, depends_on)
     backend_name = _check_backend(backend, repo_root)
     _check_change_policy(change_policy)
+    # retry policy defaults come from repo config; explicit values win
+    cfg = g.load_config(repo_root)
+    if max_retries is None:
+        max_retries = cfg.get("default_max_retries", g.DEFAULT_MAX_RETRIES)
+    if retry_backoff_seconds is None:
+        retry_backoff_seconds = cfg.get("default_retry_backoff_seconds",
+                                        g.DEFAULT_RETRY_BACKOFF_SECONDS)
+    max_retries = _check_max_retries(max_retries)
+    retry_backoff_seconds = _check_retry_backoff(retry_backoff_seconds)
     g.append_event(repo_root, actor, "node_added", node_id, {
         "title": title or "",
         "intent": {"goal": goal or "", "context": context or "",
@@ -107,6 +146,8 @@ def add_node(repo_root: Any, actor: str, node_id: str, *,
         "change_policy": change_policy,
         "backend": backend_name,
         "backend_config": dict(backend_config or {}),
+        "max_retries": max_retries,
+        "retry_backoff_seconds": retry_backoff_seconds,
     })
     return g.load_graph(repo_root)[node_id]
 
@@ -141,6 +182,11 @@ def edit_node(repo_root: Any, actor: str, node_id: str,
         fields["blast_radius"] = _check_blast_radius(fields.get("blast_radius"))
     if "change_policy" in fields:
         fields["change_policy"] = _check_change_policy(fields["change_policy"])
+    if "max_retries" in fields:
+        fields["max_retries"] = _check_max_retries(fields["max_retries"])
+    if "retry_backoff_seconds" in fields:
+        fields["retry_backoff_seconds"] = _check_retry_backoff(
+            fields["retry_backoff_seconds"])
     if "backend" in fields:
         fields["backend"] = _check_backend(fields["backend"], repo_root)
     if delete:
