@@ -49,6 +49,12 @@ VALID_EVENT_TYPES = {
     # serve auth failures. Informational like shipped/release: no node
     # state is derived, so apply_event ignores them.
     "security",
+    # lifecycle rejections (Phase 7): a fenced mutation that raised
+    # (stale token, double-claim, invalid transition) is recorded here
+    # with the reason, never with secrets. Informational: apply_event
+    # only bumps the node's rejected_count, so operators can see
+    # contention in `skein log`, `skein status`, and the timeline UI.
+    "rejected",
 }
 
 # Statuses a human may set directly via node edit / web UI. Terminal and
@@ -180,6 +186,9 @@ def new_node(node_id: str, title: str = "", intent: Optional[Dict[str, str]] = N
         "shipped": {},
         "handoff_note": None,
         "evidence": [],
+        # lifecycle rejections recorded against this node (Phase 7);
+        # informational only, derived from "rejected" events
+        "rejected_count": 0,
         "version": 0,
         "removed": False,
     }
@@ -607,6 +616,16 @@ def apply_event(nodes: Dict[str, Dict[str, Any]], ev: Dict[str, Any]) -> None:
         # log (shipping.list_releases), which keeps graph.json free of
         # non-node records.
         return
+    elif etype == "rejected":
+        # Informational audit of a fenced mutation that raised (stale
+        # token, double-claim, invalid transition). Only the count is
+        # derived; the full reasons stay in the log/timeline. Nodes from
+        # old snapshots predate the field, hence the defensive .get().
+        node = nodes.get(nid)
+        if node is None or node.get("removed"):
+            return
+        node["rejected_count"] = int(node.get("rejected_count") or 0) + 1
+        node["version"] += 1
     elif etype == "human_interrupt":
         node = nodes.get(nid)
         if node is None or node.get("removed"):

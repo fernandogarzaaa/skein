@@ -1,5 +1,30 @@
 # Changelog
 
+## Unreleased (Phase 7: UI and observability)
+
+- Lifecycle rejections are now visible: fenced mutations that raise
+  (`claim`, `heartbeat`, `release`, `complete`, `fail`) record an
+  informational `rejected` event (op + reason, never secrets) via a
+  decorator in `claim.py`. `apply_event` derives only a per-node
+  `rejected_count`, so the fencer and state machine are untouched.
+  Surfaces in `skein log --rejected`, the new `REJ` column in
+  `skein status`, and the timeline UI.
+- Web observability in `serve.py` (server-rendered HTML, no new
+  dependencies): `/timeline` (reverse-chronological event timeline
+  with `?node=` and `?type=` filters), `/node/<id>` (status, claim,
+  attempt history, retry policy, worktree, result, shipped state,
+  handoff, evidence), `/api/metrics` (JSON: nodes by status, events,
+  attempts by outcome, pending retries, shipped, uptime, per-backend
+  done/failed), `/metrics` (Prometheus text with `skein_*` gauges),
+  `/api/health` (git/log/worktree writability, version).
+- CLI observability: `skein status --watch` (2s refresh until Ctrl-C),
+  `skein log --tail N --follow --rejected`, and `skein doctor`
+  (read-only: git, log parseability, worktree root, orphaned
+  worktrees via the extracted `find_orphaned_worktrees()`, expired
+  leases, config validity; exit 0/1 with one-line fix hints).
+- `gc_worktrees()` was refactored to share its scan with doctor
+  through `find_orphaned_worktrees()`; removal behavior unchanged.
+
 ## Unreleased (Phase 6: security and sandboxing)
 
 - Secret redaction at write boundaries (`src/skein/redact.py`):

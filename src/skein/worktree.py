@@ -457,16 +457,16 @@ def _worktrees_root(repo_root: str | Path) -> Path:
     return worktree_path_for(repo_root, "x").parent
 
 
-def gc_worktrees(repo_root: str | Path) -> List[str]:
-    """Remove orphaned and stale skein worktrees. Returns human-readable
-    descriptions of what was removed.
+def find_orphaned_worktrees(repo_root: str | Path) -> List[Tuple[str, str]]:
+    """Scan for orphaned/stale skein worktrees without removing anything.
 
-    Removes a registered worktree when no live (non-removed) node claims
-    its path, or when its branch ref is gone. Removes directories under
+    Returns (path, reason) pairs: registered worktrees no live node
+    claims (or whose branch ref is gone), plus directories under
     .skein/worktrees that are not registered git worktrees at all.
-    The main repo working tree is never touched.
+    The main repo working tree is never reported. Shared read-only
+    core of gc_worktrees() and `skein doctor`.
     """
-    removed: List[str] = []
+    found: List[Tuple[str, str]] = []
     root = Path(repo_root).resolve()
     wt_root = _worktrees_root(repo_root).resolve()
     nodes = g.load_graph(repo_root)
@@ -503,15 +503,8 @@ def gc_worktrees(repo_root: str | Path) -> List[str]:
                     repo_root, "rev-parse", "--verify",
                     expected_branch).returncode != 0:
                 reason = f"branch '{expected_branch}' is gone"
-        if not reason:
-            continue
-        r = _git(repo_root, "worktree", "remove", "--force", wpath)
-        if r.returncode == 0:
-            removed.append(f"removed worktree {wpath} ({reason})")
-        else:
-            removed.append(f"could not remove worktree {wpath}: "
-                           f"{r.stderr.strip()[:200]}")
-    _git(repo_root, "worktree", "prune")
+        if reason:
+            found.append((wpath, reason))
     # Stale directories: under .skein/worktrees but not registered worktrees.
     if wt_root.is_dir():
         reg_paths = set()
@@ -528,8 +521,32 @@ def gc_worktrees(repo_root: str | Path) -> List[str]:
                     continue
             except OSError:
                 continue
-            shutil.rmtree(child, ignore_errors=True)
-            removed.append(f"removed stale directory {child}")
+            found.append((str(child), "stale directory (not a registered worktree)"))
+    return found
+
+
+def gc_worktrees(repo_root: str | Path) -> List[str]:
+    """Remove orphaned and stale skein worktrees. Returns human-readable
+    descriptions of what was removed.
+
+    Removes a registered worktree when no live (non-removed) node claims
+    its path, or when its branch ref is gone. Removes directories under
+    .skein/worktrees that are not registered git worktrees at all.
+    The main repo working tree is never touched.
+    """
+    removed: List[str] = []
+    for wpath, reason in find_orphaned_worktrees(repo_root):
+        if reason.startswith("stale directory"):
+            shutil.rmtree(wpath, ignore_errors=True)
+            removed.append(f"removed stale directory {wpath}")
+            continue
+        r = _git(repo_root, "worktree", "remove", "--force", wpath)
+        if r.returncode == 0:
+            removed.append(f"removed worktree {wpath} ({reason})")
+        else:
+            removed.append(f"could not remove worktree {wpath}: "
+                           f"{r.stderr.strip()[:200]}")
+    _git(repo_root, "worktree", "prune")
     return removed
 
 

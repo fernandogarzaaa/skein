@@ -1,4 +1,4 @@
-# Skein v0.1 — parallel task-graph orchestration for coding agents
+# Skein v0.2 — parallel task-graph orchestration for coding agents
 
 Skein lets multiple coding agents claim and work nodes of a shared task
 graph in parallel without stepping on each other, using git worktrees for

@@ -8,9 +8,10 @@ import json
 import os
 import subprocess
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional
 
 from . import graph as g
 from . import claim as c
@@ -594,17 +595,20 @@ def _cmd_tag_release(args, root: str) -> int:
     return 0
 
 
-def cmd_status(args) -> int:
-    root = find_repo_root()
+def _status_lines(root: str) -> List[str]:
+    """Render the status table as lines (shared by `status` and
+    `status --watch`)."""
+    lines: List[str] = []
     reaped = c.reap_expired(root)
     if reaped:
-        print(f"reaper released expired leases: {', '.join(reaped)}")
+        lines.append(f"reaper released expired leases: {', '.join(reaped)}")
     nodes = g.load_graph(root)
     if not nodes:
-        print("(empty graph)")
-        return 0
+        lines.append("(empty graph)")
+        return lines
     now = datetime.now(timezone.utc)
-    print(f"{'ID':<22}{'STATUS':<12}{'HOLDER':<16}{'LEASE':<14}{'TRIES':<6}{'SHIPPED':<16}NOTE")
+    lines.append(f"{'ID':<22}{'STATUS':<12}{'HOLDER':<16}{'LEASE':<14}"
+                 f"{'TRIES':<6}{'REJ':<5}{'SHIPPED':<16}NOTE")
     for nid in sorted(nodes):
         n = nodes[nid]
         claim = n.get("claim") or {}
@@ -622,23 +626,149 @@ def cmd_status(args) -> int:
                 remain = (ra - now).total_seconds()
                 lease = f"backoff {int(remain)}s" if remain > 0 else "retry due"
         tries = len(n.get("attempts") or [])
+        rej = n.get("rejected_count") or 0
         shipped = ",".join(sorted((n.get("shipped") or {}).keys())) or "-"
         note = ""
         if n["status"] == "needs_human" and n.get("handoff_note"):
             note = str(n["handoff_note"]).splitlines()[0][:80]
-        print(f"{nid:<22}{n['status']:<12}{holder:<16}{lease:<14}{tries:<6}{shipped:<16}{note}")
+        lines.append(f"{nid:<22}{n['status']:<12}{holder:<16}{lease:<14}"
+                     f"{tries:<6}{rej:<5}{shipped:<16}{note}")
+    return lines
+
+
+def cmd_status(args) -> int:
+    root = find_repo_root()
+    if not args.watch:
+        for line in _status_lines(root):
+            print(line)
+        return 0
+    # Live view: refresh every 2s until Ctrl-C. The ANSI clear is only
+    # emitted on a tty so piped output stays a plain event stream.
+    try:
+        while True:
+            if sys.stdout.isatty():
+                sys.stdout.write("\033[2J\033[H")
+            for line in _status_lines(root):
+                print(line)
+            sys.stdout.flush()
+            time.sleep(2.0)
+    except KeyboardInterrupt:
+        pass
     return 0
+
+
+def _format_event(e: dict) -> str:
+    return (f"{e.get('timestamp')}  {e.get('actor'):>12}  "
+            f"{e.get('type'):<15}  {e.get('node_id')}  "
+            f"{json.dumps(e.get('payload', {}))[:200]}")
 
 
 def cmd_log(args) -> int:
     root = find_repo_root()
     events = g.load_events(root)
+    if args.rejected:
+        events = [e for e in events if e.get("type") == "rejected"]
     if args.node:
         events = [e for e in events if e.get("node_id") == args.node]
-    for e in events[-args.limit:]:
-        print(f"{e.get('timestamp')}  {e.get('actor'):>12}  {e.get('type'):<15}  "
-              f"{e.get('node_id')}  {json.dumps(e.get('payload', {}))[:200]}")
+    limit = args.tail if args.tail is not None else args.limit
+    for e in (events[-limit:] if limit else []):
+        print(_format_event(e))
+    if args.follow:
+        # Stream new events as they land until Ctrl-C.
+        seen = len(g.load_events(root))
+        try:
+            while True:
+                time.sleep(1.0)
+                fresh = g.load_events(root)
+                for e in fresh[seen:]:
+                    if args.rejected and e.get("type") != "rejected":
+                        continue
+                    if args.node and e.get("node_id") != args.node:
+                        continue
+                    print(_format_event(e))
+                seen = len(fresh)
+        except KeyboardInterrupt:
+            pass
     return 0
+
+
+def cmd_doctor(args) -> int:
+    """Repo health check: every check prints ok/FAIL with a one-line fix
+    hint. Exit 0 when all pass, 1 otherwise. Read-only: never reaps,
+    reclaims, or mutates the repo."""
+    import shutil
+    from . import ids
+    root = find_repo_root()
+    failures = 0
+
+    def check(name: str, ok: bool, hint: str = "") -> None:
+        nonlocal failures
+        if ok:
+            print(f"ok   {name}")
+        else:
+            failures += 1
+            print(f"FAIL {name}" + (f": {hint}" if hint else ""))
+
+    # 1. git available
+    check("git available", shutil.which("git") is not None,
+          "install git and put it on PATH")
+
+    # 2. event log parseable
+    try:
+        events, skipped = g.load_events_diagnostics(root)
+        check(f"event log parseable ({len(events)} events)",
+              skipped == 0,
+              f"{skipped} unparsable lines: inspect {g.log_path(root)}")
+    except OSError as e:
+        check("event log parseable", False, f"cannot read log: {e}")
+
+    # 3. worktree root exists and is writable
+    wt_root = ids.worktree_path_for(root, "x").parent
+    check("worktree root usable",
+          (not wt_root.exists()) or (wt_root.is_dir() and os.access(str(wt_root), os.W_OK)),
+          f"{wt_root} is not a writable directory")
+
+    # 4. no orphaned worktrees
+    try:
+        orphans = wt.find_orphaned_worktrees(root)
+        check(f"no orphaned worktrees ({len(orphans)} found)",
+              not orphans,
+              "run `skein worktree gc` to reclaim them")
+    except OSError as e:
+        check("no orphaned worktrees", False, f"scan failed: {e}")
+
+    # 5. no nodes stuck on an expired lease (read-only: no reaping here)
+    try:
+        nodes = g.load_graph(root)
+        stuck = sorted(nid for nid, n in nodes.items()
+                       if n.get("status") in ("claimed", "in_progress")
+                       and c.is_expired(n))
+        check(f"no expired leases ({len(stuck)} stuck)",
+              not stuck,
+              f"run `skein reap`: {', '.join(stuck[:5])}")
+    except OSError as e:
+        check("no expired leases", False, f"cannot load graph: {e}")
+
+    # 6. config valid
+    try:
+        cfg = g.load_config(root)
+        known = {"default_ttl_seconds", "heartbeat_interval_seconds",
+                 "default_max_retries", "default_retry_backoff_seconds",
+                 "default_sandbox"}
+        problems = [f"unknown key '{k}'" for k in cfg if k not in known]
+        for key in ("default_ttl_seconds", "heartbeat_interval_seconds",
+                    "default_max_retries", "default_retry_backoff_seconds"):
+            v = cfg.get(key)
+            if v is not None and not (isinstance(v, (int, float))
+                                      and not isinstance(v, bool) and v >= 0):
+                problems.append(f"'{key}' must be a non-negative number")
+        if "default_sandbox" in cfg and not isinstance(cfg["default_sandbox"], bool):
+            problems.append("'default_sandbox' must be true/false")
+        check("config valid", not problems, "; ".join(problems))
+    except (OSError, ValueError) as e:
+        check("config valid", False, f"cannot parse config.json: {e}")
+
+    return 1 if failures else 0
 
 
 def cmd_backends_list(args) -> int:
@@ -926,12 +1056,23 @@ def build_parser() -> argparse.ArgumentParser:
     prl.set_defaults(func=cmd_release)
 
     ps = sub.add_parser("status", help="all nodes, claims, health of active leases")
+    ps.add_argument("--watch", action="store_true",
+                    help="refresh the table every 2s until Ctrl-C")
     ps.set_defaults(func=cmd_status)
 
     pl = sub.add_parser("log", help="human-readable event history")
     pl.add_argument("--node", default=None)
     pl.add_argument("--limit", type=int, default=50)
+    pl.add_argument("--tail", type=int, default=None,
+                    help="show the last N events (overrides --limit)")
+    pl.add_argument("--follow", action="store_true",
+                    help="stream new events as they land until Ctrl-C")
+    pl.add_argument("--rejected", action="store_true",
+                    help="show only rejected lifecycle events")
     pl.set_defaults(func=cmd_log)
+
+    pd = sub.add_parser("doctor", help="repo health check (read-only)")
+    pd.set_defaults(func=cmd_doctor)
 
     prp = sub.add_parser("reap", help="release expired leases now")
     prp.set_defaults(func=cmd_reap)
