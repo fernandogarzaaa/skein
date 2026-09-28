@@ -349,8 +349,8 @@ def auto_merge_parents(repo_root: str | Path, integ_id: str,
     except c.ClaimError:
         return False  # owned by someone else; leave it alone
     token = (inode.get("claim") or {})["claim_token"]
-    result_commit = _merge_in_temp(repo_root, integ_id, dep_refs,
-                                   integ_branch)
+    result_commit, conflicts = _merge_in_temp(repo_root, integ_id, dep_refs,
+                                              integ_branch)
     if result_commit:
         c.complete_node(
             repo_root, integ_id, "skein-auto-merge", token,
@@ -364,35 +364,56 @@ def auto_merge_parents(repo_root: str | Path, integ_id: str,
                     "commit": result_commit,
                     "changed_files": [], "diff_stats": {}})
         return True
-    c.release_node(repo_root, integ_id, actor=actor, claim_token=token,
-                   note="auto-merge conflicted; needs an agent to resolve")
+    # Conflict: park the node for a human with the conflict list in the
+    # event payload and the handoff note, instead of silently releasing
+    # it back to unclaimed. The human_interrupt clears the auto-merge
+    # claim atomically; the node_edited then records what conflicts.
+    files = ", ".join(conflicts) if conflicts else "(unknown files)"
+    note = (f"auto-merge conflicted on: {files}; resolve the conflicts "
+            f"in branch '{integ_branch}' and mark the node done")
+    g.append_event(repo_root, actor, "human_interrupt", integ_id,
+                   {"action": "edit",
+                    "reason": note,
+                    "conflicts": conflicts,
+                    "integration_branch": integ_branch})
+    g.append_event(repo_root, actor, "node_edited", integ_id,
+                   {"handoff_note": note})
     return False
 
 
 def _merge_in_temp(repo_root: str | Path, integ_id: str,
-                   dep_refs: List[str], integ_branch: str) -> Optional[str]:
+                   dep_refs: List[str], integ_branch: str
+                   ) -> Tuple[Optional[str], List[str]]:
     """Merge parent refs into the integration branch inside a throwaway
-    worktree (never touches the user's checkout). Returns the merge
-    commit SHA on success, None on conflict."""
+    worktree (never touches the user's checkout).
+
+    Returns (merge_commit, conflict_files): merge_commit is the new
+    branch HEAD on success; on conflict it is None and conflict_files
+    lists the paths git could not auto-merge."""
     import tempfile
     tmp = Path(tempfile.mkdtemp(prefix="skein-integrate-"))
     try:
         r = subprocess.run(["git", "worktree", "add", str(tmp), integ_branch],
                            cwd=str(repo_root), capture_output=True, text=True)
         if r.returncode != 0:
-            return None
+            return None, []
         for other in dep_refs[1:]:
             m = subprocess.run(["git", "merge", "--no-ff", "--no-edit", other],
                                cwd=str(tmp), capture_output=True, text=True)
             if m.returncode != 0:
+                u = subprocess.run(
+                    ["git", "diff", "--name-only", "--diff-filter=U"],
+                    cwd=str(tmp), capture_output=True, text=True)
+                conflicts = sorted(l for l in (u.stdout or "").splitlines()
+                                   if l.strip())
                 subprocess.run(["git", "merge", "--abort"], cwd=str(tmp),
                                capture_output=True)
                 subprocess.run(["git", "worktree", "remove", "--force", str(tmp)],
                                cwd=str(repo_root), capture_output=True)
-                return None
+                return None, conflicts
         subprocess.run(["git", "worktree", "remove", "--force", str(tmp)],
                        cwd=str(repo_root), capture_output=True)
-        return _git(repo_root, "rev-parse", integ_branch).stdout.strip()
+        return _git(repo_root, "rev-parse", integ_branch).stdout.strip(), []
     finally:
         subprocess.run(["git", "worktree", "prune"], cwd=str(repo_root),
                        capture_output=True)

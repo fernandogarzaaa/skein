@@ -1,5 +1,57 @@
 # Changelog
 
+## Unreleased (Phase 5: integration and shipping lifecycle)
+
+- `skein ship <node-id> [--to <branch>] [--ff-only] [--force]`: merges a
+  done node's recorded result commit into the target branch (default:
+  the current branch). Refuses nodes that are not done, have no result
+  record, or whose result commit object is gone (`BaseCommitUnavailable`,
+  never a dead ref). Default is a `--no-ff` merge commit
+  `skein: ship <id> (<short-sha>)` with skein-local commit identity;
+  `--ff-only` fails unless the target fast-forwards. The merge runs in
+  the live checkout when the target is checked out, otherwise in a
+  throwaway worktree, and is aborted on conflict (conflicting files are
+  reported, no half-merged state). A `shipped` event records node,
+  result commit, target branch, merge commit, and divergence info.
+  Idempotent: an already-ancestor result reports "already shipped" with
+  no new commit and no event.
+- Divergence guard: the target is compared against the result's
+  recorded base by tree diff outside `.skein` (control-plane commits
+  are ignored, otherwise every ship would warn). Real movement requires
+  `--force`, recorded as `diverged`/`forced` on the event.
+- `skein ship --all [--to <branch>]`: ships every done node with a
+  result record in dependency order (integration nodes last), with a
+  per-node table (shipped / already-shipped / skipped with reason). A
+  node whose dependency did not ship is skipped with
+  "dependency <id> not shipped". Within one run the divergence guard is
+  relaxed (each ship legitimately moves the target for the next); merge
+  conflicts still abort per node and are reported as skips.
+- Integration conflict surfacing: when the `__integrate` auto-merge
+  conflicts, the node is parked at `needs_human` via `human_interrupt`
+  (claim cleared atomically) with the conflicting file list in the
+  event payload and the handoff note, instead of silently releasing
+  back to unclaimed. `skein status` shows the note for `needs_human`
+  nodes, and the child stays blocked naming the parked node.
+- `skein release <tag> [--message] [--allow-unshipped]`: creates an
+  annotated tag on the target branch HEAD and appends a `release` event
+  (repo-level, anchored at the reserved `skein-release` id) with the
+  tag, head, and nodes shipped since the previous release. Refuses a
+  dirty working tree (outside `.skein`), duplicate or invalid tag names
+  (must match `^[A-Za-z0-9._-]+$`), and unshipped done nodes unless
+  `--allow-unshipped`. A done node whose result commit is already an
+  ancestor of the target (e.g. landed via a manual conflict resolution
+  after `ship` aborted) does not block the release. Only merge commits
+  and tags are created; history is never rewritten.
+- The existing `skein release <id>` (claim release) is unchanged when
+  the target names a live node; anything else is treated as a tag name.
+  A tag colliding with a live node id always takes the claim path.
+- Ship/release state rides on the event log: `shipped` events derive
+  `node["shipped"]` per target branch via `reduce_events` (shown in the
+  new SHIPPED column of `skein status`); `release` events derive no
+  node state and are listed by scanning the log. The web API exposes
+  the same functions: `POST /api/nodes/<id>/ship`,
+  `POST /api/release`, and read-only shipped state in `/api/graph`.
+
 ## Unreleased (Phase 4: scheduler and retries)
 
 - Per-node retry policy: `skein node add --max-retries N

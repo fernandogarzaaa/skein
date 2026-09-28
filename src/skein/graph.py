@@ -41,6 +41,9 @@ VALID_EVENT_TYPES = {
     "node_added", "node_edited", "node_removed",
     "claimed", "heartbeat", "released",
     "completed", "failed", "human_interrupt",
+    # shipping lifecycle (Phase 5): informational, not fenced lifecycle
+    # transitions, so they bypass lifecycle_transition_error
+    "shipped", "release",
 }
 
 # Statuses a human may set directly via node edit / web UI. Terminal and
@@ -165,6 +168,10 @@ def new_node(node_id: str, title: str = "", intent: Optional[Dict[str, str]] = N
                   "claimed_at": None, "ttl_seconds": None, "last_heartbeat": None},
         "worktree": {"branch": None, "base_branch": None, "path": None},
         "result": None,
+        # shipping state, derived from "shipped" events: {target_branch: {
+        # result_commit, merge_commit, base_commit, diverged, forced,
+        # shipped_at, target_branch}}
+        "shipped": {},
         "handoff_note": None,
         "evidence": [],
         "version": 0,
@@ -569,6 +576,31 @@ def apply_event(nodes: Dict[str, Dict[str, Any]], ev: Dict[str, Any]) -> None:
             node["retry_at"] = None
         node["claim"] = _empty_claim()
         node["version"] += 1
+    elif etype == "shipped":
+        node = nodes.get(nid)
+        if node is None or node.get("removed"):
+            return
+        # One record per target branch: re-shipping after a re-run
+        # updates the entry for that branch with the newer result.
+        target_branch = payload.get("target_branch") or "unknown"
+        shipped = node.get("shipped") or {}
+        shipped[target_branch] = {
+            "result_commit": payload.get("result_commit"),
+            "merge_commit": payload.get("merge_commit"),
+            "base_commit": payload.get("base_commit"),
+            "diverged": bool(payload.get("diverged")),
+            "forced": bool(payload.get("forced")),
+            "shipped_at": ev.get("timestamp"),
+            "target_branch": target_branch,
+        }
+        node["shipped"] = shipped
+        node["version"] += 1
+    elif etype == "release":
+        # Repo-level event anchored at the reserved "skein-release" id.
+        # No node state is derived: releases are listed by scanning the
+        # log (shipping.list_releases), which keeps graph.json free of
+        # non-node records.
+        return
     elif etype == "human_interrupt":
         node = nodes.get(nid)
         if node is None or node.get("removed"):

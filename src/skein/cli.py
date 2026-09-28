@@ -535,6 +535,17 @@ def cmd_run(args) -> int:
 
 def cmd_release(args) -> int:
     root = find_repo_root()
+    # One `release` verb, two jobs, disambiguated by the target: a live
+    # node id releases that node's claim (the long-standing behavior);
+    # anything else is treated as a release tag name (Phase 5). A tag
+    # that collides with a live node id always takes the claim path.
+    node = g.load_graph(root).get(args.target)
+    if node is not None and not node.get("removed"):
+        return _cmd_claim_release(args, root)
+    return _cmd_tag_release(args, root)
+
+
+def _cmd_claim_release(args, root: str) -> int:
     actor = default_actor()
     token = None
     if not args.force:
@@ -542,19 +553,34 @@ def cmd_release(args) -> int:
         # fencing token (read from the local claim record); anyone else
         # must pass --force for an explicit, logged override.
         try:
-            claim = c.current_claim(root, args.id)
+            claim = c.current_claim(root, args.target)
         except c.ClaimError:
             claim = {}
         if claim.get("holder") == actor:
             token = claim.get("claim_token")
     try:
-        c.release_node(root, args.id, actor=actor,
+        c.release_node(root, args.target, actor=actor,
                        force=args.force, note="force-released by human" if args.force else "",
                        claim_token=token)
     except c.ClaimError as e:
-        print(f"cannot release '{args.id}': {e}", file=sys.stderr)
+        print(f"cannot release '{args.target}': {e}", file=sys.stderr)
         return 1
-    print(f"released {args.id}" + (" (forced)" if args.force else ""))
+    print(f"released {args.target}" + (" (forced)" if args.force else ""))
+    return 0
+
+
+def _cmd_tag_release(args, root: str) -> int:
+    from . import shipping as sh
+    try:
+        r = sh.release_tag(root, args.target, message=args.message,
+                           allow_unshipped=args.allow_unshipped,
+                           actor=default_actor())
+    except sh.ReleaseError as e:
+        print(f"cannot release '{args.target}': {e}", file=sys.stderr)
+        return 1
+    print(f"released {r['tag']} on {r['target']} ({r['head'][:8]})")
+    if r["shipped_nodes"]:
+        print(f"shipped since last release: {', '.join(r['shipped_nodes'])}")
     return 0
 
 
@@ -568,7 +594,7 @@ def cmd_status(args) -> int:
         print("(empty graph)")
         return 0
     now = datetime.now(timezone.utc)
-    print(f"{'ID':<22}{'STATUS':<12}{'HOLDER':<16}{'LEASE':<14}TRIES")
+    print(f"{'ID':<22}{'STATUS':<12}{'HOLDER':<16}{'LEASE':<14}{'TRIES':<6}{'SHIPPED':<16}NOTE")
     for nid in sorted(nodes):
         n = nodes[nid]
         claim = n.get("claim") or {}
@@ -586,7 +612,11 @@ def cmd_status(args) -> int:
                 remain = (ra - now).total_seconds()
                 lease = f"backoff {int(remain)}s" if remain > 0 else "retry due"
         tries = len(n.get("attempts") or [])
-        print(f"{nid:<22}{n['status']:<12}{holder:<16}{lease:<14}{tries}")
+        shipped = ",".join(sorted((n.get("shipped") or {}).keys())) or "-"
+        note = ""
+        if n["status"] == "needs_human" and n.get("handoff_note"):
+            note = str(n["handoff_note"]).splitlines()[0][:80]
+        print(f"{nid:<22}{n['status']:<12}{holder:<16}{lease:<14}{tries:<6}{shipped:<16}{note}")
     return 0
 
 
@@ -731,6 +761,52 @@ def cmd_reap(args) -> int:
     return 0
 
 
+def cmd_ship(args) -> int:
+    from . import shipping as sh
+    root = find_repo_root()
+    actor = default_actor()
+    if getattr(args, "all", False):
+        if args.id:
+            print("cannot combine a node id with --all", file=sys.stderr)
+            return 1
+        try:
+            results = sh.ship_all(root, target=args.to, actor=actor)
+        except (sh.ShipError, wt.BaseCommitUnavailable) as e:
+            print(f"ship --all failed: {e}", file=sys.stderr)
+            return 1
+        print(f"{'NODE':<24}{'STATUS':<16}DETAIL")
+        for r in results:
+            if r["status"] == "shipped":
+                detail = f"-> {r['target']} {r['merge_commit'][:8]}"
+            elif r["status"] == "already-shipped":
+                detail = f"already in {r['target']}"
+            else:
+                detail = r.get("reason", "")
+            print(f"{r['node_id']:<24}{r['status']:<16}{detail}")
+        done = sum(1 for r in results if r["status"] == "shipped")
+        already = sum(1 for r in results if r["status"] == "already-shipped")
+        skipped = sum(1 for r in results if r["status"] == "skipped")
+        print(f"{done} shipped, {already} already shipped, {skipped} skipped")
+        return 0
+    if not args.id:
+        print("node id required (or use --all)", file=sys.stderr)
+        return 1
+    try:
+        r = sh.ship_node(root, args.id, target=args.to,
+                         ff_only=args.ff_only, force=args.force, actor=actor)
+    except (sh.ShipError, wt.BaseCommitUnavailable) as e:
+        print(f"cannot ship '{args.id}': {e}", file=sys.stderr)
+        return 1
+    if r["status"] == "already-shipped":
+        print(f"{args.id}: already shipped "
+              f"(result {r['result_commit'][:8]} in {r['target']})")
+    else:
+        extra = " (diverged base, forced)" if r.get("diverged") else ""
+        print(f"shipped {args.id} -> {r['target']} "
+              f"as {r['merge_commit'][:8]}{extra}")
+    return 0
+
+
 # ---------- parser ----------
 
 def build_parser() -> argparse.ArgumentParser:
@@ -818,10 +894,14 @@ def build_parser() -> argparse.ArgumentParser:
     pr.add_argument("--adapter-args", nargs=argparse.REMAINDER, default=[])
     pr.set_defaults(func=cmd_run)
 
-    prl = sub.add_parser("release", help="release a node's claim")
-    prl.add_argument("id")
+    prl = sub.add_parser("release", help="release a node's claim, or cut a release tag")
+    prl.add_argument("target", help="node id (releases its claim) or tag name (e.g. v0.1.0)")
     prl.add_argument("--force", action="store_true",
                      help="explicit force-release of another holder's claim (logged)")
+    prl.add_argument("--message", default=None,
+                     help="release tag annotation (default: 'skein release <tag>')")
+    prl.add_argument("--allow-unshipped", action="store_true",
+                     help="cut the release tag even with unshipped done nodes")
     prl.set_defaults(func=cmd_release)
 
     ps = sub.add_parser("status", help="all nodes, claims, health of active leases")
@@ -834,6 +914,19 @@ def build_parser() -> argparse.ArgumentParser:
 
     prp = sub.add_parser("reap", help="release expired leases now")
     prp.set_defaults(func=cmd_reap)
+
+    psh = sub.add_parser("ship", help="merge a done node's result commit into a branch")
+    psh.add_argument("id", nargs="?", default=None,
+                     help="node id (omit with --all)")
+    psh.add_argument("--all", action="store_true",
+                     help="ship every done node with a result record, in dependency order")
+    psh.add_argument("--to", default=None,
+                     help="target branch (default: current branch)")
+    psh.add_argument("--ff-only", action="store_true",
+                     help="fail unless the merge can fast-forward")
+    psh.add_argument("--force", action="store_true",
+                     help="ship even though the target moved past the recorded base")
+    psh.set_defaults(func=cmd_ship)
 
     psy = sub.add_parser("sync", help="share the event log via git (fetch/merge/push)")
     psy.add_argument("--no-push", action="store_true")

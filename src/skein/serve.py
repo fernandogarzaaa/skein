@@ -133,6 +133,19 @@ class _Handler(BaseHTTPRequestHandler):
                 except c.ClaimError as e:
                     return self._send(409, {"error": str(e)})
                 return self._send(200, {"node": node})
+            if len(parts) == 4 and parts[3] == "ship":
+                # Same rules as `skein ship`: the shipping module owns the
+                # merge, the event, and the error cases.
+                from . import shipping as sh
+                from . import worktree as wt
+                try:
+                    result = sh.ship_node(
+                        self._root, node_id, target=body.get("to"),
+                        ff_only=bool(body.get("ff_only", False)),
+                        force=bool(body.get("force", False)), actor=actor)
+                except (sh.ShipError, wt.BaseCommitUnavailable) as e:
+                    return self._send(409, {"error": str(e)})
+                return self._send(200, {"result": result})
             if len(parts) == 3:
                 fields = {k: v for k, v in body.items()
                           if k in ("title", "intent", "depends_on", "blast_radius",
@@ -147,6 +160,18 @@ class _Handler(BaseHTTPRequestHandler):
                     return self._send(code, {"error": str(e)})
                 return self._send(200, {"outcome": outcome,
                                         "node": g.load_graph(self._root).get(node_id)})
+        # POST /api/release  (same rules as `skein release`)
+        if parts == ["api", "release"]:
+            from . import shipping as sh
+            try:
+                result = sh.release_tag(
+                    self._root, str(body.get("tag") or ""),
+                    message=body.get("message"),
+                    allow_unshipped=bool(body.get("allow_unshipped", False)),
+                    actor=actor)
+            except sh.ReleaseError as e:
+                return self._send(409, {"error": str(e)})
+            return self._send(200, {"result": result})
         return self._send(404, {"error": "not found"})
 
 
