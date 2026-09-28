@@ -90,16 +90,22 @@ class ProfileAdapter(BackendAdapter):
             cfg = merged
         return self.sample_argv(self.build_prompt(node), cfg)
 
-    def run(self, node: Dict, worktree_path: str | Path, timeout: int = 600
-            ) -> Tuple[int, str]:
+    def run(self, node: Dict, worktree_path: str | Path, timeout: int = 600,
+            sandbox: bool = False) -> Tuple[int, str]:
         """Run the backend through the canonical runtime: bounded,
         interruptible execution with the profile's stdin mode and output
-        parser applied. Missing binary is exit 127, never an exception."""
+        parser applied. Missing binary is exit 127, never an exception.
+
+        The backend's environment is scrubbed to the allowlist
+        (ambient secrets are not inherited); sandbox=True additionally
+        applies prlimit(1) CPU/memory caps on Linux, best-effort.
+        """
         from .. import runtime as rt
         cmd = self.build_command(node)
         stdin_text = self.build_prompt(node) if self.profile.prompt_mode == "stdin" else None
         r = rt.execute(cmd, cwd=worktree_path, timeout=timeout,
-                       stdin_text=stdin_text)
+                       stdin_text=stdin_text, env=rt.minimal_environ(),
+                       sandbox=sandbox)
         if r.exit_code == 127:
             return 127, r.stderr
         if r.timed_out:

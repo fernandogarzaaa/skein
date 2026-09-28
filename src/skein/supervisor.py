@@ -25,6 +25,7 @@ from typing import Dict, List, Optional, Tuple
 from . import graph as g
 from . import claim as c
 from . import ids
+from . import redact
 from . import worktree as wt
 from . import verify as v
 from . import runtime as rt
@@ -67,15 +68,19 @@ def _collect_parent_handoffs(nodes: Dict[str, Dict], node: Dict) -> str:
 
 
 def _write_adapter_evidence(repo_root: str, adapter, node_id: str,
-                            adapter_exit: int, adapter_output: str) -> Dict:
+                            adapter_exit: int, adapter_output: str
+                            ) -> Tuple[Dict, int]:
+    """Write the backend's output to an evidence file, redacted at write
+    time so secrets never land in .skein/evidence/ verbatim. Returns
+    (evidence_entry, redacted_hit_count)."""
     ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%f")
     ev_file = v.evidence_subdir(repo_root) / ids.evidence_name(node_id, f"{ts}_adapter")
     ev_file.parent.mkdir(parents=True, exist_ok=True)
-    ev_file.write_text(
-        f"adapter={getattr(adapter, 'name', '?')} exit={adapter_exit}\n{adapter_output[-20000:]}",
-        encoding="utf-8")
-    return {"command": f"<adapter:{getattr(adapter, 'name', '?')}>",
-            "exit_code": adapter_exit, "output_ref": str(ev_file)}
+    hits = redact.write_redacted(
+        ev_file,
+        f"adapter={getattr(adapter, 'name', '?')} exit={adapter_exit}\n{adapter_output[-20000:]}")
+    return ({"command": f"<adapter:{getattr(adapter, 'name', '?')}>",
+             "exit_code": adapter_exit, "output_ref": str(ev_file)}, hits)
 
 
 def _parse_adapter_output(adapter, result: "rt.ExecutionResult") -> Tuple[int, str]:
@@ -187,8 +192,15 @@ def run_node(repo_root: str | Path, node_id: str, holder: str,
              poll_interval: float = 1.0,
              adapter_timeout: float = 1800.0,
              extra_args: Optional[list] = None,
-             actor: Optional[str] = None) -> Dict:
-    """Full supervised path: claim -> worktree -> adapter -> verify -> report."""
+             actor: Optional[str] = None,
+             sandbox: bool = False) -> Dict:
+    """Full supervised path: claim -> worktree -> adapter -> verify -> report.
+
+    sandbox=True scrubs the backend's environment to the allowlist and,
+    on Linux, wraps it in prlimit(1) CPU/memory caps. The sandbox is
+    best-effort: when it cannot apply, the run continues unsandboxed and
+    a `security` event records why.
+    """
     from .adapters.engine import ProfileAdapter
     from .adapters.profiles import get_profile
     actor = actor or holder
@@ -253,10 +265,20 @@ def run_node(repo_root: str | Path, node_id: str, holder: str,
                           daemon=True)
     hb.start()
 
+    def _audit_redaction(hits: int, source: str) -> None:
+        # Count per event, never the secret itself.
+        if hits:
+            g.append_event(repo_root, actor, "security", node_id,
+                           {"kind": "redaction", "source": source,
+                            "redacted_count": hits})
+
     # launch backend headlessly against the worktree through the
     # canonical runtime: bounded, interruptible, whole-tree kill on
-    # abort/timeout. The profile's output parser is applied so evidence
-    # matches what ProfileAdapter.run() would record.
+    # abort/timeout. The backend's environment is scrubbed to the
+    # allowlist (ambient secrets are not inherited); sandbox=True
+    # additionally applies prlimit caps on Linux. The profile's output
+    # parser is applied so evidence matches what ProfileAdapter.run()
+    # would record.
     if hasattr(adapter, "build_command"):
         cmd = adapter.build_command(node_for_adapter)
     else:
@@ -271,7 +293,12 @@ def run_node(repo_root: str | Path, node_id: str, holder: str,
         cmd, cwd=path, timeout=adapter_timeout, stdin_text=stdin_text,
         should_abort=lambda: _interrupted(repo_root, node_id, started_ts),
         poll_interval=poll_interval,
+        env=rt.minimal_environ(),
+        sandbox=sandbox,
     )
+    if result.sandbox_note:
+        g.append_event(repo_root, actor, "security", node_id,
+                       {"kind": "sandbox_fallback", "note": result.sandbox_note})
     adapter_exit, adapter_output = _parse_adapter_output(adapter, result)
     aborted = result.aborted
     # Ceiling so a stalled agent process (e.g. waiting on a permission
@@ -296,8 +323,9 @@ def run_node(repo_root: str | Path, node_id: str, holder: str,
 
     if timed_out:
         stop.set()
-        adapter_ev = _write_adapter_evidence(repo_root, adapter, node_id,
-                                             adapter_exit, adapter_output)
+        adapter_ev, adapter_redacted = _write_adapter_evidence(
+            repo_root, adapter, node_id, adapter_exit, adapter_output)
+        _audit_redaction(adapter_redacted, "adapter_evidence")
         try:
             c.fail_node(repo_root, node_id, holder, claim_token,
                         evidence=[adapter_ev],
@@ -330,13 +358,16 @@ def run_node(repo_root: str | Path, node_id: str, holder: str,
     # (adapter_exit) is never sufficient on its own. Verification is
     # cancellable: an interrupt mid-command kills the command's process
     # tree and stops the remaining commands.
-    ok, evidence = v.run_completion(path, node.get("intent", {}).get("completion", ""),
-                                    v.evidence_subdir(repo_root), node_id,
-                                    timeout=verify_timeout,
-                                    should_abort=lambda: _interrupted(
-                                        repo_root, node_id, started_ts))
-    adapter_ev = _write_adapter_evidence(repo_root, adapter, node_id,
-                                         adapter_exit, adapter_output)
+    ok, evidence, verify_redacted = v.run_completion(
+        path, node.get("intent", {}).get("completion", ""),
+        v.evidence_subdir(repo_root), node_id,
+        timeout=verify_timeout,
+        should_abort=lambda: _interrupted(
+            repo_root, node_id, started_ts))
+    adapter_ev, adapter_redacted = _write_adapter_evidence(
+        repo_root, adapter, node_id, adapter_exit, adapter_output)
+    _audit_redaction(verify_redacted, "verification_evidence")
+    _audit_redaction(adapter_redacted, "adapter_evidence")
     evidence = evidence + [adapter_ev]
     stop.set()
 

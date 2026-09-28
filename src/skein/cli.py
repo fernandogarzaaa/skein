@@ -96,7 +96,8 @@ def cmd_init(args) -> int:
             json.dumps({"default_ttl_seconds": ttl,
                         "heartbeat_interval_seconds": 60,
                         "default_max_retries": 3,
-                        "default_retry_backoff_seconds": 60}, indent=2),
+                        "default_retry_backoff_seconds": 60,
+                        "default_sandbox": False}, indent=2),
             encoding="utf-8")
     if not g.log_path(root).exists():
         g.log_path(root).write_text("", encoding="utf-8")
@@ -351,10 +352,18 @@ def _run_one_node(root: str, node_id: str, holder: str, actor: str,
                           heartbeat_interval=args.heartbeat_interval,
                           adapter_timeout=args.adapter_timeout,
                           extra_args=args.adapter_args or [],
-                          actor=actor)
+                          actor=actor,
+                          sandbox=_effective_sandbox(root, args))
     except (c.ClaimError, ValueError, RuntimeError) as e:
         return f"skipped: {e}"
     return result.get("outcome", "unknown")
+
+
+def _effective_sandbox(root: str, args) -> bool:
+    """--sandbox wins; otherwise the repo config default_sandbox."""
+    if getattr(args, "sandbox", False):
+        return True
+    return bool(g.load_config(root).get("default_sandbox", False))
 
 
 def _integration_pending(nodes: dict, node: dict) -> bool:
@@ -520,7 +529,8 @@ def cmd_run(args) -> int:
                           heartbeat_interval=args.heartbeat_interval,
                           adapter_timeout=args.adapter_timeout,
                           extra_args=adapter_args,
-                          actor=default_actor())
+                          actor=default_actor(),
+                          sandbox=_effective_sandbox(root, args))
     except (c.ClaimError, ValueError, RuntimeError) as e:
         print(f"run failed: {e}", file=sys.stderr)
         return 1
@@ -715,7 +725,13 @@ def cmd_backends_remove(args) -> int:
 
 def cmd_serve(args) -> int:
     from .serve import serve_forever
-    serve_forever(find_repo_root(), host=args.host, port=args.port)
+    token = args.auth_token or os.environ.get("SKEIN_AUTH_TOKEN")
+    try:
+        serve_forever(find_repo_root(), host=args.host, port=args.port,
+                      auth_token=token)
+    except ValueError as e:
+        print(f"serve: {e}", file=sys.stderr)
+        return 1
     return 0
 
 
@@ -892,6 +908,11 @@ def build_parser() -> argparse.ArgumentParser:
     pr.add_argument("--adapter-timeout", type=float, default=1800.0,
                     help="ceiling for the backend process; on expiry it is killed and the node fails")
     pr.add_argument("--adapter-args", nargs=argparse.REMAINDER, default=[])
+    pr.add_argument("--sandbox", action="store_true",
+                    help="sandbox the backend: scrubbed env (always on for backends) "
+                    "plus prlimit CPU/memory caps on Linux (best-effort; warns and "
+                    "continues unsandboxed when unavailable). Also settable via "
+                    "config.json default_sandbox")
     pr.set_defaults(func=cmd_run)
 
     prl = sub.add_parser("release", help="release a node's claim, or cut a release tag")
@@ -936,6 +957,10 @@ def build_parser() -> argparse.ArgumentParser:
     psv = sub.add_parser("serve", help="live web canvas (graph view + human editing)")
     psv.add_argument("--host", default="127.0.0.1")
     psv.add_argument("--port", type=int, default=8765)
+    psv.add_argument("--auth-token", default=None,
+                     help="require Authorization: Bearer <token> for mutating API "
+                     "requests (or set SKEIN_AUTH_TOKEN); GETs stay open. "
+                     "Binding 0.0.0.0 without a token is refused")
     psv.set_defaults(func=cmd_serve)
 
     pib = sub.add_parser("infer-blast",

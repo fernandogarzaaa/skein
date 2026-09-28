@@ -8,7 +8,7 @@ PY = sys.executable
 
 
 def test_passing_completion(tmp_path):
-    ok, evidence = v.run_completion(tmp_path, f"{PY} -c \"print('hello')\"", tmp_path / "ev", "n1")
+    ok, evidence, _redacted = v.run_completion(tmp_path, f"{PY} -c \"print('hello')\"", tmp_path / "ev", "n1")
     assert ok is True
     assert evidence[0]["exit_code"] == 0
     assert evidence[0]["output_ref"] is not None
@@ -17,7 +17,7 @@ def test_passing_completion(tmp_path):
 
 
 def test_failing_completion_marks_failed(tmp_path):
-    ok, evidence = v.run_completion(tmp_path, f"{PY} -c \"raise SystemExit(3)\"", tmp_path / "ev", "n1")
+    ok, evidence, _redacted = v.run_completion(tmp_path, f"{PY} -c \"raise SystemExit(3)\"", tmp_path / "ev", "n1")
     assert ok is False
     assert evidence[0]["exit_code"] == 3
 
@@ -41,7 +41,7 @@ def test_gate_drives_done_failed_transitions(tmp_path):
         "depends_on": [], "blast_radius": []})
     g.append_event(repo, "t", "claimed", "bad", {"holder": "h", "ttl_seconds": 60})
     node = g.load_graph(repo)["bad"]
-    ok, evidence = v.run_completion(repo, node["intent"]["completion"],
+    ok, evidence, _redacted = v.run_completion(repo, node["intent"]["completion"],
                                     v.evidence_subdir(repo), "bad")
     assert ok is False
     g.append_event(repo, "sup", "failed", "bad",

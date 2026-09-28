@@ -224,7 +224,7 @@ def test_run_completion_abort_stops_commands(tmp_path):
         seen.append(1)
         return True
 
-    ok, evidence = v.run_completion(tmp_path, "echo one\necho two",
+    ok, evidence, _redacted = v.run_completion(tmp_path, "echo one\necho two",
                                     tmp_path / "ev", "n1",
                                     should_abort=abort)
     assert ok is False

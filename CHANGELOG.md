@@ -1,5 +1,48 @@
 # Changelog
 
+## Unreleased (Phase 6: security and sandboxing)
+
+- Secret redaction at write boundaries (`src/skein/redact.py`):
+  `redact_secrets()` masks AWS keys (`AKIA...`), GitHub tokens
+  (`ghp_`/`gho_`), `sk-`/`sk-ant-` API keys, `xoxb-`/`xoxp-` Slack
+  tokens, PEM private-key blocks, and `password=`/`api_key=`
+  assignments. Applied at three boundaries so nothing unredacted
+  reaches `.skein/log.ndjson` or `.skein/evidence/`: the event-log
+  payload writer (`append_event` redacts every payload), evidence file
+  writers (verification evidence and supervisor adapter evidence), and
+  therefore handoff notes (they flow through the payload writer).
+  Redaction is idempotent, leaves ordinary prose mentioning
+  "password"/"secret" untouched, and already-stored data is never
+  mutated.
+- Backend environment scrubbing: `runtime.execute()` takes an `env`
+  parameter; backend runs (supervisor and `ProfileAdapter.run()`) now
+  start from `minimal_environ()` (PATH, HOME, LANG, `SKEIN_*`, plus
+  SystemRoot on Windows) instead of inheriting the ambient environment.
+- `skein run --sandbox` (also `default_sandbox` in config.json):
+  scrubs the backend env and, on Linux, wraps the backend in
+  `prlimit(1)` caps (600s CPU, 8 GiB address space). Best-effort: when
+  prlimit is missing or the platform is not Linux, the run continues
+  unsandboxed with a note, never fails. Missing binaries still report
+  exit 127 with the real binary name.
+- `skein serve` hardening: `--auth-token` (or `SKEIN_AUTH_TOKEN`); when
+  set, mutating requests (POST/PUT/DELETE) require
+  `Authorization: Bearer <token>` (401 otherwise, constant-time
+  comparison) while GETs stay open. 1 MB request body cap (413),
+  best-effort per-IP rate limit of 60 requests/minute (429). Binding
+  0.0.0.0 without a token is refused with a clear error. Failed auth
+  attempts are audited as `security` events without logging the
+  presented credential.
+- `security` event type: informational (no node state derived, bypasses
+  the lifecycle fencer like `shipped`/`release`). Recorded for
+  redaction hits (count per event, never the secret), sandbox
+  fallbacks, and serve auth failures; visible in `skein log`.
+- Known tradeoff (documented): the env allowlist means backends that
+  relied on ambient credentials (e.g. `ANTHROPIC_API_KEY`) must receive
+  them via `SKEIN_`-prefixed variables mapped by their wrapper; and a
+  literal secret baked into `backend_config` or a completion command is
+  redacted at the write boundary, so backend auth belongs in the
+  environment, not in node intent.
+
 ## Unreleased (Phase 5: integration and shipping lifecycle)
 
 - `skein ship <node-id> [--to <branch>] [--ff-only] [--force]`: merges a
