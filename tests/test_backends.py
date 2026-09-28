@@ -18,6 +18,7 @@ from skein import graph as g
 from skein.adapters.engine import ProfileAdapter
 from skein.adapters.profiles import get_profile
 from skein.cli import main as skein_main
+from skein.runtime import ExecutionResult
 
 
 @pytest.fixture
@@ -125,11 +126,12 @@ def test_passthrough_parser_shape():
 
 def test_run_missing_binary_message_shape():
     from skein.adapters.claude_code import ClaudeCodeAdapter
-    with patch.object(engine_mod.subprocess, "run",
-                      side_effect=FileNotFoundError("nope")):
-        code, out = ClaudeCodeAdapter(binary="nope-bin").run(_node(), ".")
+    # no mock: a genuinely absent binary must become exit 127, never an
+    # exception, through the canonical runtime
+    code, out = ClaudeCodeAdapter(
+        binary="nope-bin-definitely-missing-xyz").run(_node(), ".")
     assert code == 127
-    assert out.startswith("nope-bin binary not found: nope-bin:")
+    assert out.startswith("nope-bin-definitely-missing-xyz binary not found:")
 
 
 def test_gemini_argv_and_parser():
@@ -154,13 +156,13 @@ def test_gemini_run_mocked():
     profile = get_profile("gemini_cli")
     seen = {}
 
-    def fake_run(cmd, **kw):
+    def fake_execute(cmd, **kw):
         seen["cmd"] = cmd
         seen["cwd"] = kw.get("cwd")
-        return SimpleNamespace(stdout='{"text": "did it"}\n', stderr="",
-                               returncode=0)
+        return ExecutionResult(exit_code=0, stdout='{"text": "did it"}\n',
+                               stderr="")
 
-    with patch.object(engine_mod.subprocess, "run", fake_run):
+    with patch("skein.runtime.execute", fake_execute):
         code, out = ProfileAdapter(profile, binary="gemini").run(_node(), "/tmp/wt")
     assert code == 0
     assert out == "did it"
@@ -210,18 +212,18 @@ def test_stdin_prompt_mode():
                              verified=False)
     seen = {}
 
-    def fake_run(cmd, **kw):
+    def fake_execute(cmd, **kw):
         seen.update(kw)
         seen["cmd"] = cmd
-        return SimpleNamespace(stdout="ok", stderr="", returncode=0)
+        return ExecutionResult(exit_code=0, stdout="ok", stderr="")
 
     node = _node()
     adapter = ProfileAdapter(profile)
     assert "ok" not in " ".join(adapter.build_command(node))
-    with patch.object(engine_mod.subprocess, "run", fake_run):
+    with patch("skein.runtime.execute", fake_execute):
         code, out = adapter.run(node, ".")
     assert (code, out) == (0, "ok")
-    assert seen["input"] == adapter.build_prompt(node)
+    assert seen["stdin_text"] == adapter.build_prompt(node)
 
 
 # ---------- Stage 8d: backends list + README matrix in lockstep ----------

@@ -92,18 +92,18 @@ class ProfileAdapter(BackendAdapter):
 
     def run(self, node: Dict, worktree_path: str | Path, timeout: int = 600
             ) -> Tuple[int, str]:
+        """Run the backend through the canonical runtime: bounded,
+        interruptible execution with the profile's stdin mode and output
+        parser applied. Missing binary is exit 127, never an exception."""
+        from .. import runtime as rt
         cmd = self.build_command(node)
         stdin_text = self.build_prompt(node) if self.profile.prompt_mode == "stdin" else None
-        try:
-            r = subprocess.run(cmd, cwd=str(worktree_path), capture_output=True,
-                               text=True, timeout=timeout,
-                               input=stdin_text)
-            result = self.profile.output_parser(r.stdout or "", r.stderr or "",
-                                                r.returncode)
-            return result.exit_code, result.output
-        except FileNotFoundError as e:
-            resolved = self.resolve_binary()
-            return 127, f"{resolved} binary not found: {resolved}: {e}"
-        except subprocess.TimeoutExpired:
+        r = rt.execute(cmd, cwd=worktree_path, timeout=timeout,
+                       stdin_text=stdin_text)
+        if r.exit_code == 127:
+            return 127, r.stderr
+        if r.timed_out:
             resolved = self.resolve_binary()
             return 124, f"{resolved} invocation timed out after {timeout}s"
+        result = self.profile.output_parser(r.stdout, r.stderr, r.exit_code)
+        return result.exit_code, result.output
