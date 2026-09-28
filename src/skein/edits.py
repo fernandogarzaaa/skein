@@ -13,6 +13,7 @@ from typing import Any, Dict, List, Optional
 
 from . import graph as g
 from . import ids
+from . import worktree as wt
 
 
 def _check_backend(backend: str, repo_root: Any) -> str:
@@ -111,10 +112,15 @@ def add_node(repo_root: Any, actor: str, node_id: str, *,
 
 
 def edit_node(repo_root: Any, actor: str, node_id: str,
-              fields: Dict[str, Any], delete: bool = False) -> str:
+              fields: Dict[str, Any], delete: bool = False,
+              delete_branch: bool = False) -> str:
     """Apply an edit. Returns 'edited', 'interrupt', 'removed' or
     'interrupt_delete'. Raises ValueError on unknown node / bad status /
-    unknown backend / empty edit / illegal transition."""
+    unknown backend / empty edit / illegal transition.
+
+    Deleting a node also removes its worktree (branch kept unless
+    delete_branch is set), so the CLI and the web canvas share one rule.
+    """
     ids.validate_node_id(node_id)
     nodes = g.load_graph(repo_root)
     node = nodes.get(node_id)
@@ -153,6 +159,10 @@ def edit_node(repo_root: Any, actor: str, node_id: str,
                 f"cannot delete '{node_id}': still depended on by "
                 f"{', '.join(sorted(dependents))}")
         g.append_event(repo_root, actor, "node_removed", node_id, {})
+        # Shared rule: a deleted node must not leave a worktree behind.
+        # The node_removed event is already appended, so the node still
+        # carries its worktree record for remove_worktree to find.
+        wt.remove_worktree(repo_root, node_id, delete_branch=delete_branch)
         return "removed"
     if not fields:
         raise ValueError("nothing to edit")

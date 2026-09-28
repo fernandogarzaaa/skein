@@ -13,6 +13,7 @@ import hashlib
 import json
 import os
 import subprocess
+import time
 import uuid
 from copy import deepcopy
 from dataclasses import dataclass, field, asdict
@@ -571,7 +572,18 @@ def _log_fingerprint(repo_root: str | Path) -> Tuple[int, Optional[str], str]:
 def _write_atomic(path: Path, text: str) -> None:
     tmp = path.with_name(path.name + ".tmp")
     tmp.write_text(text, encoding="utf-8")
-    os.replace(tmp, path)
+    # Windows: a concurrent reader (or an AV scan) can hold the destination
+    # open without delete sharing, so the rename can fail with
+    # PermissionError even though nothing is logically wrong. The window
+    # is tiny; retry briefly instead of surfacing a spurious failure.
+    for attempt in range(10):
+        try:
+            os.replace(tmp, path)
+            return
+        except PermissionError:
+            if attempt == 9:
+                raise
+            time.sleep(0.05)
 
 
 def rebuild_graph(repo_root: str | Path) -> Dict[str, Dict[str, Any]]:
