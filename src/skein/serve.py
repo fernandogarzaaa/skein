@@ -106,6 +106,10 @@ def _event_summary(ev: Dict[str, Any]) -> str:
         return f"security: {p.get('kind')}"
     if etype == "rejected":
         return f"rejected {p.get('op')}: {(p.get('reason') or '')[:160]}"
+    if etype == "plan_applied":
+        ids = p.get("node_ids") or []
+        return (f"plan applied ({p.get('source') or '?'}): "
+                f"{len(ids)} node(s): {', '.join(ids[:6])}")[:160]
     return (json.dumps(p)[:160])
 
 

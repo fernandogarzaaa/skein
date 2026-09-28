@@ -141,6 +141,22 @@ skein infer-blast auth-3
 skein node edit auth-3 --blast-radius "src/auth/**"
 ```
 
+## Planner: draft a DAG from a goal
+
+`skein plan` turns a goal description into a reviewable DAG draft.
+Planning is read-only: nothing is created until `skein plan --apply`.
+The heuristic brain (default) parses markdown task lists:
+numbered lists chain, bullets under a heading run parallel with
+stages ordered sequentially, and "after X" hints become edges.
+`--llm` delegates to the executable named by `SKEIN_PLANNER_CMD`
+instead (never a silent fallback).
+
+```bash
+skein plan "Build auth: 1. design schema 2. implement login 3. write tests"
+skein plan --apply          # create nodes from the latest draft
+skein plan --from-git-log   # draft from recent commit subjects
+```
+
 ## Multi-machine sync
 
 The event log is append-only, so concurrent appends on two machines

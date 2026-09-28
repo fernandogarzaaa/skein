@@ -1,5 +1,43 @@
 # Changelog
 
+## Unreleased (Phase 8: planner and automatic DAG generation)
+
+- `skein plan` turns a goal description into a reviewable DAG draft
+  (`src/skein/planner.py`). Planning is read-only: nothing touches the
+  graph until `skein plan --apply`. Drafts are versioned JSON
+  (`{"version": 1, ...}`); unknown versions are refused.
+- Heuristic brain (default, no network, no LLM): parses markdown task
+  lists deterministically. Numbered lists become sequential chains
+  (including `1. a 2. b 3. c` written inline on one line); bulleted
+  lists under a heading become parallel nodes with headings ordered
+  sequentially (each stage depends on all nodes of the previous
+  stage); explicit "after X" / "depends on X" / "once X is done" /
+  "following X" hints become edges (parenthesized hints included).
+  Unmatched hints warn instead of failing. Dependency cycles are
+  refused with the cycle path. A prose-only goal yields a single node.
+- LLM brain (`--llm`): pipes a JSON spec (goal, source text, existing
+  node titles/statuses, tracked files) to the executable named by
+  `SKEIN_PLANNER_CMD` and validates the returned draft (schema
+  version, node ids, dep targets, no cycles, no id reuse). A missing,
+  failing, or misbehaving command is a hard error: it never silently
+  falls back to the heuristic, so the operator always knows which
+  brain produced the plan.
+- Draft review loop: `skein plan` prints the draft DAG and saves it to
+  `.skein/plan-<ts>.json` (goal text redacted at the write boundary,
+  like all stored content); `--dry-run` prints without saving;
+  `--list` lists saved drafts; `skein plan --apply [draft]` (default:
+  latest) creates nodes through the validated `add_node` path.
+  Applying is idempotent: the draft's semantic hash (excluding
+  `created_at`) is recorded in a `plan_applied` event anchored at the
+  reserved `skein-plan` id (informational, like shipping's `release`);
+  a second apply errors unless `--force`, which skips already-existing
+  nodes so partially applied plans can be resumed.
+- `skein plan --from-git-log [--commits N]` builds a sequential draft
+  from recent commit subjects (oldest first).
+- Each draft node gets a generated completion prompt template from its
+  task text and the goal; node ids are slugified from titles with
+  `-2`/`-3` disambiguation and always pass id validation.
+
 ## Unreleased (Phase 7: UI and observability)
 
 - Lifecycle rejections are now visible: fenced mutations that raise

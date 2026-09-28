@@ -865,6 +865,81 @@ def cmd_serve(args) -> int:
     return 0
 
 
+def cmd_plan(args) -> int:
+    from . import planner
+    root = find_repo_root()
+
+    if args.list:
+        drafts = planner.list_drafts(root)
+        if not drafts:
+            print("no saved drafts")
+        for d in drafts:
+            print(d.name)
+        return 0
+
+    if args.apply is not None:
+        if args.apply == "latest":
+            path = planner.latest_draft(root)
+            if path is None:
+                print("no saved drafts to apply", file=sys.stderr)
+                return 1
+        else:
+            path = Path(args.apply)
+            if not path.is_absolute():
+                path = Path(root) / ".skein" / path.name
+        try:
+            draft = planner.load_draft(path)
+            created, skipped = planner.apply_draft(
+                root, default_actor(), draft, path.name,
+                force=args.force)
+        except planner.PlanError as e:
+            print(f"plan: {e}", file=sys.stderr)
+            return 1
+        except ValueError as e:
+            print(f"plan: {e}", file=sys.stderr)
+            return 1
+        print(f"applied draft {path.name}: created {len(created)} node(s)")
+        for nid in created:
+            print(f"  {nid}")
+        for nid in skipped:
+            print(f"  {nid} (already exists, skipped)")
+        return 0
+
+    # build a new draft (read-only unless --dry-run is off, which only
+    # writes the draft file; nodes are never created here)
+    if args.from_git_log and args.llm:
+        print("plan: --from-git-log and --llm are mutually exclusive",
+              file=sys.stderr)
+        return 1
+    text = args.goal or ""
+    if args.file:
+        try:
+            text += "\n" + Path(args.file).read_text(encoding="utf-8")
+        except OSError as e:
+            print(f"plan: cannot read --file: {e}", file=sys.stderr)
+            return 1
+    try:
+        if args.from_git_log:
+            draft = planner.plan_from_git_log(root, args.commits)
+        elif args.llm:
+            draft = planner.parse_llm(args.goal or text, text, root)
+        else:
+            if not text.strip():
+                print("plan: need a goal, --file, or --from-git-log",
+                      file=sys.stderr)
+                return 1
+            draft = planner.parse_heuristic(text, goal=args.goal or "")
+    except planner.PlanError as e:
+        print(f"plan: {e}", file=sys.stderr)
+        return 1
+    if args.dry_run:
+        print(planner.render_draft(draft))
+        return 0
+    path = planner.save_draft(root, draft)
+    print(planner.render_draft(draft, str(path)))
+    return 0
+
+
 def cmd_infer_blast(args) -> int:
     from .infer import suggest_blast_radius
     root = find_repo_root()
@@ -1109,6 +1184,29 @@ def build_parser() -> argparse.ArgumentParser:
     pib.add_argument("id")
     pib.add_argument("--top-n", type=int, default=5)
     pib.set_defaults(func=cmd_infer_blast)
+
+    ppl = sub.add_parser("plan",
+                         help="draft a task DAG from a goal (review before applying)")
+    ppl.add_argument("goal", nargs="?", default="",
+                     help="goal description; may contain a numbered/bulleted task list")
+    ppl.add_argument("--file", default=None,
+                     help="read additional task list from a markdown file")
+    ppl.add_argument("--dry-run", action="store_true",
+                     help="print the draft without saving it")
+    ppl.add_argument("--llm", action="store_true",
+                     help="use the external SKEIN_PLANNER_CMD instead of the heuristic")
+    ppl.add_argument("--apply", nargs="?", const="latest", default=None,
+                     metavar="DRAFT",
+                     help="create nodes from a saved draft (default: latest)")
+    ppl.add_argument("--force", action="store_true",
+                     help="apply a draft that was already applied")
+    ppl.add_argument("--from-git-log", action="store_true",
+                     help="draft a sequential plan from recent commit subjects")
+    ppl.add_argument("--commits", type=int, default=20,
+                     help="commits to read for --from-git-log (default 20)")
+    ppl.add_argument("--list", action="store_true",
+                     help="list saved drafts")
+    ppl.set_defaults(func=cmd_plan)
 
     pb = sub.add_parser("backends", help="backend profile registry")
     bsub = pb.add_subparsers(dest="backends_cmd", required=True)
