@@ -88,6 +88,13 @@ skein run auth-3 --agent-id agent-1
 # held by someone else
 skein log --node auth-3
 skein release auth-3 --force
+
+# ship a done node's result commit to the current branch (idempotent;
+# refuses if the target moved in real files since the result's recorded
+# base unless --force), then tag the branch as a release
+skein ship auth-3
+skein ship --all            # every done node with a result, in order
+skein release v0.1.0        # annotated tag + release event in the log
 ```
 
 While an agent runs, a human editing (or deleting) its node appends a
