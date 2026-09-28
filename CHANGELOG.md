@@ -1,5 +1,27 @@
 # Changelog
 
+## Unreleased (Phase 2: canonical execution runtime)
+
+- One execution path: `runtime.execute()` is now the single
+  spawn/drain/kill implementation used by the supervisor, the verifier,
+  and `ProfileAdapter.run()`. Separate stdout/stderr capture feeds the
+  backend's exact `(stdout, stderr, exit_code)` triple to its output
+  parser, so supervised evidence matches `adapter.run()` byte for byte.
+- The supervisor no longer bypasses parsers: stream-json backends
+  (gemini, cursor) now record harvested text as evidence instead of raw
+  event JSON. Legacy adapters without a profile keep the stdout plus
+  stderr-trailer shape.
+- Missing backend binary is exit 127 through every path, never an
+  uncaught `FileNotFoundError` (the old supervisor `Popen` call could
+  crash `run_node` outright).
+- Verification is cancellable: `run_completion()` takes `should_abort`
+  and the supervisor wires its interrupt check in, so a human interrupt
+  kills a running completion command's process tree and stops the rest.
+- Windows process-tree kill is real now: `taskkill /PID /T /F` replaces
+  the old best-effort direct-child terminate; tree-kill tests use
+  forward-slash pidfile paths (the old `r'C:\...'` embedding was a
+  `SyntaxError` on Windows via the `\U` escape).
+
 ## Unreleased (Phase 1: correctness and state-machine invariants)
 
 - Fenced claims: every claim mints an immutable `attempt_id` and

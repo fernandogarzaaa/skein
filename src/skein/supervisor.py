@@ -78,6 +78,21 @@ def _write_adapter_evidence(repo_root: str, adapter, node_id: str,
             "exit_code": adapter_exit, "output_ref": str(ev_file)}
 
 
+def _parse_adapter_output(adapter, result: "rt.ExecutionResult") -> Tuple[int, str]:
+    """Apply the backend's output parser to the raw (stdout, stderr,
+    exit_code) triple, so supervised evidence matches what
+    ProfileAdapter.run() records. Adapters without a profile keep the
+    legacy shape: stdout plus a stderr trailer."""
+    parser = getattr(getattr(adapter, "profile", None), "output_parser", None)
+    if parser is None:
+        out = result.stdout
+        if result.stderr:
+            out += "\n--- stderr ---\n" + result.stderr
+        return result.exit_code, out
+    parsed = parser(result.stdout, result.stderr, result.exit_code)
+    return parsed.exit_code, parsed.output
+
+
 def _git_in(worktree_path: str | Path, *args: str) -> subprocess.CompletedProcess:
     return subprocess.run(["git"] + list(args), cwd=str(worktree_path),
                           capture_output=True, text=True)
@@ -238,11 +253,10 @@ def run_node(repo_root: str | Path, node_id: str, holder: str,
                           daemon=True)
     hb.start()
 
-    # launch backend headlessly against the worktree. The child runs in
-    # its own process group (POSIX) so aborts/timeouts kill the whole
-    # tree it spawns, not just the direct child. stdout is drained
-    # continuously: reading only after exit deadlocks once the pipe
-    # buffer fills. Output is bounded; the tail is kept as evidence.
+    # launch backend headlessly against the worktree through the
+    # canonical runtime: bounded, interruptible, whole-tree kill on
+    # abort/timeout. The profile's output parser is applied so evidence
+    # matches what ProfileAdapter.run() would record.
     if hasattr(adapter, "build_command"):
         cmd = adapter.build_command(node_for_adapter)
     else:
@@ -253,41 +267,23 @@ def run_node(repo_root: str | Path, node_id: str, holder: str,
     profile = getattr(adapter, "profile", None)
     if getattr(profile, "prompt_mode", "") == "stdin":
         stdin_text = adapter.build_prompt(node_for_adapter)
-    proc = rt.spawn_monitored(cmd, path, stdin_text=stdin_text)
-    out_buf = rt.BoundedBuffer()
-    adapter_exit = -1
-    aborted = False
-    timed_out = False
-    t0 = time.monotonic()
-    while True:
-        rt.drain_available(proc, out_buf)
-        rc = proc.poll()
-        if _interrupted(repo_root, node_id, started_ts):
-            aborted = True
-            rt.drain_available(proc, out_buf)
-            rt.kill_tree(proc)
-            rt.drain_available(proc, out_buf)
-            adapter_exit = proc.returncode if proc.returncode is not None else -1
-            break
-        if rc is not None:
-            rt.drain_available(proc, out_buf)
-            adapter_exit = rc
-            break
-        if time.monotonic() - t0 > adapter_timeout:
-            # Ceiling so a stalled agent process (e.g. waiting on a permission
-            # prompt the headless flags didn't cover) becomes failed evidence,
-            # not a hang.
-            timed_out = True
-            rt.drain_available(proc, out_buf)
-            rt.kill_tree(proc)
-            rt.drain_available(proc, out_buf)
-            out_buf.append(
-                f"\n[skein] adapter timed out after {adapter_timeout}s; "
-                f"process tree killed\n".encode("utf-8"))
-            adapter_exit = 124
-            break
-        time.sleep(poll_interval)
-    adapter_output = out_buf.text()
+    result = rt.execute(
+        cmd, cwd=path, timeout=adapter_timeout, stdin_text=stdin_text,
+        should_abort=lambda: _interrupted(repo_root, node_id, started_ts),
+        poll_interval=poll_interval,
+    )
+    adapter_exit, adapter_output = _parse_adapter_output(adapter, result)
+    aborted = result.aborted
+    # Ceiling so a stalled agent process (e.g. waiting on a permission
+    # prompt the headless flags didn't cover) becomes failed evidence,
+    # not a hang.
+    timed_out = result.timed_out
+    if timed_out:
+        adapter_output += (
+            f"\n[skein] adapter timed out after {adapter_timeout}s; "
+            f"process tree killed")
+    if aborted:
+        adapter_output += "\n[skein] aborted by human interrupt; process tree killed"
 
     if aborted:
         stop.set()
@@ -318,9 +314,9 @@ def run_node(repo_root: str | Path, node_id: str, holder: str,
     # here - verification must not run on a node we no longer own.
     if _interrupted(repo_root, node_id, started_ts):
         stop.set()
-        proc.terminate()
-        # human_interrupt already parked the node in needs_human and
-        # cleared the claim; do not release it back to unclaimed.
+        # The adapter process already exited inside execute(); the
+        # human_interrupt event parked the node in needs_human and
+        # cleared the claim. Do not release it back to unclaimed.
         return {"outcome": "interrupted", "adapter_exit": adapter_exit,
                 "node": g.load_graph(repo_root).get(node_id)}
     if not owns_attempt():
@@ -330,10 +326,14 @@ def run_node(repo_root: str | Path, node_id: str, holder: str,
                 "node": g.load_graph(repo_root).get(node_id)}
 
     # Verification gate: run completion commands for real. Agent self-report
-    # (adapter_exit) is never sufficient on its own.
+    # (adapter_exit) is never sufficient on its own. Verification is
+    # cancellable: an interrupt mid-command kills the command's process
+    # tree and stops the remaining commands.
     ok, evidence = v.run_completion(path, node.get("intent", {}).get("completion", ""),
                                     v.evidence_subdir(repo_root), node_id,
-                                    timeout=verify_timeout)
+                                    timeout=verify_timeout,
+                                    should_abort=lambda: _interrupted(
+                                        repo_root, node_id, started_ts))
     adapter_ev = _write_adapter_evidence(repo_root, adapter, node_id,
                                          adapter_exit, adapter_output)
     evidence = evidence + [adapter_ev]

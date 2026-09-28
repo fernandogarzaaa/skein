@@ -18,6 +18,7 @@ import pytest
 from skein import graph as g
 from skein.adapters import engine as engine_mod
 from skein.adapters.engine import ProfileAdapter
+from skein.runtime import ExecutionResult
 from skein.adapters.profiles import (
     get_profile, list_profiles, load_custom_profiles, profile_from_dict,
     render_backends_table,
@@ -97,14 +98,14 @@ def test_custom_profile_mocked_run(repo):
                        "--headless", "go", "--parser", "stream_json_relaxed"]) == 0
     seen = {}
 
-    def fake_run(cmd, **kw):
+    def fake_execute(cmd, **kw):
         seen["cmd"] = cmd
-        return SimpleNamespace(stdout='{"result": "routed ok"}\n', stderr="",
-                               returncode=0)
+        return ExecutionResult(exit_code=0,
+                               stdout='{"result": "routed ok"}\n', stderr="")
 
     profile = get_profile("router", str(repo))
     assert profile.verified is False
-    with patch.object(engine_mod.subprocess, "run", fake_run):
+    with patch("skein.runtime.execute", fake_execute):
         code, out = ProfileAdapter(profile).run(_node(), ".")
     assert code == 0
     assert out == "routed ok"

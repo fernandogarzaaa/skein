@@ -27,8 +27,9 @@ import os
 import signal
 import subprocess
 import threading
+from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Callable, List, Optional, Tuple
 
 OUTPUT_CAP_BYTES = 1_000_000  # per-command output cap; the tail is kept
 _DRAIN_CHUNK = 65536
@@ -93,8 +94,8 @@ def _windows_pipe_has_data(pipe) -> bool:
     return avail.value > 0
 
 
-def drain_available(proc: "subprocess.Popen", buf: BoundedBuffer) -> None:
-    """Read whatever the child's stdout currently holds, without blocking.
+def _drain_stream(stream, buf: BoundedBuffer) -> None:
+    """Read whatever a pipe currently holds, without blocking.
 
     Must be called in a loop alongside poll(): never let the pipe sit
     undrained while the parent waits on something else.
@@ -104,12 +105,11 @@ def drain_available(proc: "subprocess.Popen", buf: BoundedBuffer) -> None:
     is unreliable for pipes, so each read is gated on PeekNamedPipe.
     """
     try:
-        pipe = proc.stdout
-        fd = pipe.fileno()
+        fd = stream.fileno()
     except (AttributeError, ValueError):
         return
     if os.name == "nt":
-        while _windows_pipe_has_data(pipe):
+        while _windows_pipe_has_data(stream):
             try:
                 chunk = os.read(fd, _DRAIN_CHUNK)
             except OSError:
@@ -131,15 +131,16 @@ def drain_available(proc: "subprocess.Popen", buf: BoundedBuffer) -> None:
 
 
 def _make_nonblocking(proc: "subprocess.Popen") -> None:
-    # POSIX only. On Windows the pipe is left in blocking mode and
-    # drain_available gates each read on PeekNamedPipe instead, because
+    # POSIX only. On Windows the pipes are left in blocking mode and
+    # _drain_stream gates each read on PeekNamedPipe instead, because
     # os.set_blocking() is unreliable for Windows pipes.
     if os.name != "posix":
         return
-    try:
-        os.set_blocking(proc.stdout.fileno(), False)
-    except (OSError, ValueError, AttributeError):
-        pass
+    for stream in (proc.stdout, proc.stderr):
+        try:
+            os.set_blocking(stream.fileno(), False)
+        except (OSError, ValueError, AttributeError):
+            pass
 
 
 def kill_tree(proc: "subprocess.Popen") -> None:
@@ -181,24 +182,34 @@ def kill_tree(proc: "subprocess.Popen") -> None:
                     proc.kill()
                 except OSError:
                     pass
+    # Reap the zombie after SIGKILL so poll()/returncode settle.
+    try:
+        proc.wait(timeout=10)
+    except (subprocess.TimeoutExpired, OSError):
+        pass
 
 
 def spawn_monitored(cmd, cwd: str | Path,
                     stdin_text: Optional[str] = None,
-                    shell: bool = False) -> "subprocess.Popen":
-    """Spawn with merged stdout/stderr on a non-blocking pipe, stdin from
-    DEVNULL (or fed once from stdin_text), and its own process group on
-    POSIX so kill_tree() reaches grandchildren.
+                    shell: bool = False,
+                    merge_streams: bool = False) -> "subprocess.Popen":
+    """Spawn with stdout/stderr on non-blocking pipes, stdin from DEVNULL
+    (or fed once from stdin_text), and its own process group on POSIX so
+    kill_tree() reaches grandchildren.
 
-    The caller owns the poll/drain loop: call drain_available(proc, buf)
-    on every iteration and kill_tree(proc) to stop.
+    With merge_streams=False (default) stderr gets its own pipe, so
+    callers can hand the backend's exact (stdout, stderr, exit_code)
+    triple to its output parser; with True, stderr merges into stdout.
+
+    The caller owns the poll/drain loop: drain every stream on every
+    iteration (see execute()) and kill_tree(proc) to stop.
     """
     stdin_cfg = subprocess.PIPE if stdin_text is not None else subprocess.DEVNULL
     proc = subprocess.Popen(
         cmd,
         cwd=str(cwd),
         stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
+        stderr=subprocess.STDOUT if merge_streams else subprocess.PIPE,
         stdin=stdin_cfg,
         shell=shell,
         bufsize=0,
@@ -225,26 +236,110 @@ def spawn_monitored(cmd, cwd: str | Path,
     return proc
 
 
+@dataclass
+class ExecutionResult:
+    """Outcome of execute(): the backend's exact (stdout, stderr,
+    exit_code) triple plus how the run ended."""
+    exit_code: int
+    stdout: str
+    stderr: str
+    truncated: bool = False
+    timed_out: bool = False
+    aborted: bool = False
+
+
+def execute(cmd, *, cwd: str | Path, timeout: float,
+            stdin_text: Optional[str] = None,
+            shell: bool = False,
+            should_abort: Optional[Callable[[], bool]] = None,
+            poll_interval: float = 0.2,
+            output_cap: int = OUTPUT_CAP_BYTES) -> ExecutionResult:
+    """The one canonical execution path for backends and shell commands.
+
+    - Continuous draining of both pipes: no 64KB deadlock.
+    - Bounded output: the tail of each stream is kept, truncation flagged.
+    - Interruptible: should_abort() is polled every iteration; on truthy
+      the whole process tree is killed and aborted=True is reported.
+    - Timeout: the whole process tree is killed, timed_out=True.
+    - Missing binary: FileNotFoundError becomes exit 127 with the
+      message on stderr, never an exception.
+
+    Callers apply their own output parsers and human-readable notes on
+    top of the raw triple; execute() adds none.
+    """
+    import time
+    try:
+        proc = spawn_monitored(cmd, cwd, stdin_text=stdin_text, shell=shell)
+    except FileNotFoundError as e:
+        binary = cmd[0] if isinstance(cmd, (list, tuple)) and cmd else cmd
+        return ExecutionResult(
+            exit_code=127, stdout="",
+            stderr=f"{binary} binary not found: {e}")
+    out_buf = BoundedBuffer(cap=output_cap)
+    err_buf = BoundedBuffer(cap=output_cap)
+    aborted = False
+    timed_out = False
+    deadline = time.monotonic() + timeout
+    while True:
+        if proc.stdout is not None:
+            _drain_stream(proc.stdout, out_buf)
+        if proc.stderr is not None:
+            _drain_stream(proc.stderr, err_buf)
+        rc = proc.poll()
+        if should_abort is not None:
+            try:
+                abort = bool(should_abort())
+            except Exception:
+                abort = False
+            if abort:
+                aborted = True
+                kill_tree(proc)
+                break
+        if rc is not None:
+            break
+        if time.monotonic() >= deadline:
+            timed_out = True
+            kill_tree(proc)
+            break
+        time.sleep(poll_interval)
+    if proc.stdout is not None:
+        _drain_stream(proc.stdout, out_buf)
+    if proc.stderr is not None:
+        _drain_stream(proc.stderr, err_buf)
+    rc = proc.poll()
+    if timed_out:
+        exit_code = 124
+    elif aborted:
+        exit_code = -1
+    elif rc is not None:
+        exit_code = rc
+    else:
+        exit_code = 124  # unreachable: kill_tree reaps before returning
+    return ExecutionResult(
+        exit_code=exit_code,
+        stdout=out_buf.text(),
+        stderr=err_buf.text(),
+        truncated=out_buf.dropped > 0 or err_buf.dropped > 0,
+        timed_out=timed_out,
+        aborted=aborted,
+    )
+
+
 def run_bounded(cmd, cwd: str | Path, timeout: float,
                 stdin_text: Optional[str] = None,
                 shell: bool = False) -> Tuple[int, str]:
     """Run to completion with continuous draining, bounded output, and
-    whole-tree kill on timeout. Returns (exit_code, output_text)."""
-    import time
-    proc = spawn_monitored(cmd, cwd, stdin_text=stdin_text, shell=shell)
-    buf = BoundedBuffer()
-    deadline = time.monotonic() + timeout
-    while True:
-        drain_available(proc, buf)
-        rc = proc.poll()
-        if rc is not None:
-            drain_available(proc, buf)
-            return rc, buf.text()
-        if time.monotonic() >= deadline:
-            drain_available(proc, buf)
-            kill_tree(proc)
-            drain_available(proc, buf)
-            buf.append(f"\n[skein] timed out after {timeout}s; process tree killed\n"
-                       .encode("utf-8"))
-            return 124, buf.text()
-        time.sleep(0.05)
+    whole-tree kill on timeout. Returns (exit_code, merged output text).
+
+    Legacy merged shape (stdout plus a stderr trailer) for callers that
+    predate the (stdout, stderr, exit_code) triple.
+    """
+    r = execute(cmd, cwd=cwd, timeout=timeout,
+                stdin_text=stdin_text, shell=shell)
+    out = r.stdout
+    if r.stderr:
+        out += "\n--- stderr ---\n" + r.stderr
+    if r.timed_out:
+        out += (f"\n[skein] timed out after {timeout}s; "
+                f"process tree killed\n")
+    return r.exit_code, out

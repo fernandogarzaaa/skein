@@ -161,3 +161,96 @@ def test_supervisor_timeout_kills_backend_tree(repo):
         time.sleep(0.2)
     else:
         pytest.fail("backend grandchild survived the supervisor abort")
+
+
+# ---------- Phase 2: canonical execution runtime ----------
+
+def test_execute_missing_binary_is_127_not_exception(tmp_path):
+    r = rt.execute(["definitely-not-a-real-binary-xyz"], cwd=str(tmp_path),
+                   timeout=5)
+    assert r.exit_code == 127
+    assert "binary not found" in r.stderr
+    assert r.aborted is False and r.timed_out is False
+
+
+def test_execute_keeps_streams_separate(tmp_path):
+    r = rt.execute(
+        [PY, "-c",
+         "import sys; sys.stdout.write('out1'); sys.stderr.write('err1')"],
+        cwd=str(tmp_path), timeout=10)
+    assert r.exit_code == 0
+    assert r.stdout == "out1"
+    assert r.stderr == "err1"
+
+
+def test_execute_abort_kills_tree(tmp_path):
+    pidfile = tmp_path / "gc.pid"
+    script = (
+        "import subprocess, sys, os, time; "
+        f"subprocess.Popen([sys.executable, '-c', "
+        f"\"import os, time; open('{pidfile.as_posix()}', 'w').write(str(os.getpid())); "
+        f"time.sleep(120)\"]); "
+        "time.sleep(120)"
+    )
+    ticks = []
+
+    def abort():
+        ticks.append(1)
+        return len(ticks) > 10  # let the tree start, then abort
+
+    r = rt.execute([PY, "-c", script], cwd=str(tmp_path), timeout=60,
+                   should_abort=abort, poll_interval=0.05)
+    assert r.aborted is True
+    assert r.exit_code == -1
+    assert r.timed_out is False
+    assert pidfile.exists()
+    pid = int(pidfile.read_text().strip())
+    deadline = time.monotonic() + 15
+    while time.monotonic() < deadline:
+        try:
+            os.kill(pid, 0)
+        except (ProcessLookupError, OSError):
+            break
+        time.sleep(0.2)
+    else:
+        pytest.fail("grandchild survived execute() abort")
+
+
+def test_run_completion_abort_stops_commands(tmp_path):
+    from skein import verify as v
+    seen = []
+
+    def abort():
+        seen.append(1)
+        return True
+
+    ok, evidence = v.run_completion(tmp_path, "echo one\necho two",
+                                    tmp_path / "ev", "n1",
+                                    should_abort=abort)
+    assert ok is False
+    assert len(evidence) == 1  # second command never started
+    assert evidence[0].get("aborted") is True
+    assert evidence[0]["exit_code"] == -1
+
+
+def test_supervisor_applies_profile_parser(repo):
+    # the supervised path must apply the backend's output parser, exactly
+    # like ProfileAdapter.run() does: raw stream-json becomes harvested text
+    from types import SimpleNamespace
+    from skein.adapters.profiles import make_stream_json_parser
+    from skein.supervisor import run_node
+    assert skein_main(["node", "add", "n1", "--completion", "true"]) == 0
+
+    class ParserAdapter(FakeAdapter):
+        profile = SimpleNamespace(
+            prompt_mode="positional",
+            output_parser=make_stream_json_parser("text"))
+
+    adapter = ParserAdapter(
+        'import sys; sys.stdout.write(\'{"text": "parsed hello"}\\n\')')
+    result = run_node(repo, "n1", "agent-1", adapter=adapter,
+                      heartbeat_interval=0.2, poll_interval=0.05)
+    assert result["outcome"] == "done"
+    node = g.load_graph(repo)["n1"]
+    assert "parsed hello" in (node["handoff_note"] or "")
+    assert '{"text"' not in (node["handoff_note"] or "")
