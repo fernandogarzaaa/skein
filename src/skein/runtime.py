@@ -63,15 +63,60 @@ class BoundedBuffer:
         return out
 
 
+def _windows_pipe_has_data(pipe) -> bool:
+    """True when a Windows pipe has unread bytes waiting.
+
+    os.set_blocking(fd, False) does not reliably make anonymous pipes
+    non-blocking on Windows, and the failure is silent: os.read() on an
+    empty pipe then blocks until the child writes or exits, which wedged
+    the timeout loop for silent children (the 120s sleeps ran to
+    completion instead of being killed at 2s). PeekNamedPipe lets us ask
+    first and only read when data is actually waiting.
+    """
+    import msvcrt
+    from ctypes import byref, windll, wintypes
+
+    try:
+        handle = msvcrt.get_osfhandle(pipe.fileno())
+    except (OSError, ValueError):
+        return False
+    kernel32 = windll.kernel32
+    kernel32.PeekNamedPipe.argtypes = [
+        wintypes.HANDLE, wintypes.LPVOID, wintypes.DWORD,
+        wintypes.LPDWORD, wintypes.LPDWORD, wintypes.LPDWORD,
+    ]
+    kernel32.PeekNamedPipe.restype = wintypes.BOOL
+    avail = wintypes.DWORD(0)
+    if not kernel32.PeekNamedPipe(handle, None, 0, None,
+                                  byref(avail), None):
+        return False  # broken/closed pipe: nothing more to drain
+    return avail.value > 0
+
+
 def drain_available(proc: "subprocess.Popen", buf: BoundedBuffer) -> None:
-    """Read whatever the child's stdout currently holds (non-blocking).
+    """Read whatever the child's stdout currently holds, without blocking.
 
     Must be called in a loop alongside poll(): never let the pipe sit
     undrained while the parent waits on something else.
+
+    POSIX: the fd is put in non-blocking mode and os.read raises
+    BlockingIOError when the pipe is empty. Windows: non-blocking mode
+    is unreliable for pipes, so each read is gated on PeekNamedPipe.
     """
     try:
-        fd = proc.stdout.fileno()
+        pipe = proc.stdout
+        fd = pipe.fileno()
     except (AttributeError, ValueError):
+        return
+    if os.name == "nt":
+        while _windows_pipe_has_data(pipe):
+            try:
+                chunk = os.read(fd, _DRAIN_CHUNK)
+            except OSError:
+                break
+            if not chunk:
+                break  # EOF
+            buf.append(chunk)
         return
     while True:
         try:
@@ -86,6 +131,11 @@ def drain_available(proc: "subprocess.Popen", buf: BoundedBuffer) -> None:
 
 
 def _make_nonblocking(proc: "subprocess.Popen") -> None:
+    # POSIX only. On Windows the pipe is left in blocking mode and
+    # drain_available gates each read on PeekNamedPipe instead, because
+    # os.set_blocking() is unreliable for Windows pipes.
+    if os.name != "posix":
+        return
     try:
         os.set_blocking(proc.stdout.fileno(), False)
     except (OSError, ValueError, AttributeError):
