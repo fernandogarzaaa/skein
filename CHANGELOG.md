@@ -1,5 +1,37 @@
 # Changelog
 
+## Unreleased (Phase 3: worktree and result-commit model)
+
+- Node deletion owns the worktree lifecycle: `skein node delete <id>`
+  removes the node's registered worktree through the same `edit_node`
+  rule the web canvas uses (the previously dead `remove_worktree()` is
+  now wired in). The branch is kept by default; `--delete-branch`
+  removes it too. Deleting a claimed or in-progress node still records
+  `human_interrupt` and parks the claim instead of yanking the worktree.
+- `skein worktree gc` reclaims orphaned and stale worktrees: registered
+  worktrees with no live node, worktrees whose branch ref is gone, and
+  unregistered directories under `.skein/worktrees`. Claimed and
+  in-progress worktrees are never touched, and the main repository
+  working tree is explicitly refused.
+- Base pinning on worktree reuse: `ensure_worktree()` records the
+  resolved `base_commit` SHA in the node's worktree record. Reuse is
+  refused when the worktree sits on a different base (HEAD is neither
+  the pinned base nor a descendant of it), when the recorded base
+  object is gone, or when a pinned-SHA base (a dependency result) no
+  longer matches because the dependency re-ran. The error directs the
+  operator to `skein worktree gc` or a node reset. The existing
+  branch-mismatch refusal is unchanged.
+- `base_branch_for()` no longer trusts recorded result SHAs blindly: a
+  dependency result commit whose object is absent from the store now
+  raises `BaseCommitUnavailable` instead of handing downstream nodes a
+  dead base. Legacy dependency branches are resolved before use too.
+- Result introspection: `skein result show <node-id>` prints the result
+  record (base/result commits, attempt, changed files, diff stats) and
+  `skein result verify <node-id>` checks it against the object store:
+  result and base objects exist, the result descends from the base, and
+  the recorded diff stats match a recomputed numstat. A missing result
+  record is an error, not an empty pass.
+
 ## Unreleased (Phase 2: canonical execution runtime)
 
 - One execution path: `runtime.execute()` is now the single

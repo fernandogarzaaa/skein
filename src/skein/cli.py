@@ -193,6 +193,85 @@ def cmd_node_edit(args) -> int:
     return 0
 
 
+def cmd_node_delete(args) -> int:
+    from .edits import edit_node
+    root = find_repo_root()
+    node = g.load_graph(root).get(args.id)
+    if node is None:
+        print(f"unknown node '{args.id}'", file=sys.stderr)
+        return 1
+    wt_path = (node.get("worktree") or {}).get("path")
+    try:
+        outcome = edit_node(root, default_actor(), args.id, {},
+                            delete=True,
+                            delete_branch=args.delete_branch)
+    except ValueError as e:
+        print(str(e), file=sys.stderr)
+        return 1
+    if outcome == "interrupt_delete":
+        print(f"node {args.id}: human_interrupt (delete) recorded; claim parked")
+    else:
+        print(f"removed node {args.id}")
+        if wt_path:
+            print(f"removed worktree {wt_path}")
+    return 0
+
+
+def cmd_worktree_gc(args) -> int:
+    from . import worktree as wt
+    root = find_repo_root()
+    removed = wt.gc_worktrees(root)
+    if not removed:
+        print("worktree gc: nothing to clean")
+    else:
+        for line in removed:
+            print(line)
+    return 0
+
+
+def cmd_result_show(args) -> int:
+    root = find_repo_root()
+    node = g.load_graph(root).get(args.id)
+    if node is None:
+        print(f"unknown node '{args.id}'", file=sys.stderr)
+        return 1
+    result = node.get("result") or {}
+    if not result.get("commit"):
+        print(f"node '{args.id}' has no result record", file=sys.stderr)
+        return 1
+    print(f"node:          {args.id}")
+    print(f"base commit:   {result.get('base_commit')}")
+    print(f"result commit: {result.get('commit')}")
+    print(f"attempt:       {result.get('attempt_id')}")
+    files = result.get("changed_files") or []
+    print(f"changed files: {len(files)}")
+    for f in files:
+        print(f"  {f}")
+    stats = result.get("diff_stats") or {}
+    if stats:
+        print("diff stats:")
+        for path in sorted(stats):
+            s = stats[path]
+            print(f"  {path}: +{s.get('added', 0)} -{s.get('deleted', 0)}")
+    return 0
+
+
+def cmd_result_verify(args) -> int:
+    from . import worktree as wt
+    root = find_repo_root()
+    try:
+        problems = wt.verify_result_record(root, args.id)
+    except wt.WorktreeError as e:
+        print(str(e), file=sys.stderr)
+        return 1
+    if problems:
+        for p in problems:
+            print(f"mismatch: {p}", file=sys.stderr)
+        return 1
+    print(f"result for '{args.id}' verified")
+    return 0
+
+
 STATUS_ICON = {"unclaimed": "o", "claimed": "C", "in_progress": ">",
                "blocked": "#", "needs_human": "?", "done": "*", "failed": "X"}
 
@@ -527,6 +606,11 @@ def build_parser() -> argparse.ArgumentParser:
                     choices=["warn", "strict", "off"])
     pe.add_argument("--delete", action="store_true")
     pe.set_defaults(func=cmd_node_edit)
+    pdel = nsub.add_parser("delete", help="delete a node and remove its worktree")
+    pdel.add_argument("id")
+    pdel.add_argument("--delete-branch", action="store_true",
+                      help="also delete the node's git branch (kept by default)")
+    pdel.set_defaults(func=cmd_node_delete)
 
     pg = sub.add_parser("graph", help="render current graph state to terminal")
     pg.set_defaults(func=cmd_graph)
@@ -618,6 +702,20 @@ def build_parser() -> argparse.ArgumentParser:
     br.add_argument("name")
     br.add_argument("--scope", default="", choices=["", "repo", "user"])
     br.set_defaults(func=cmd_backends_remove)
+
+    pw = sub.add_parser("worktree", help="worktree maintenance")
+    wsub = pw.add_subparsers(dest="worktree_cmd", required=True)
+    wg = wsub.add_parser("gc", help="remove orphaned and stale worktrees")
+    wg.set_defaults(func=cmd_worktree_gc)
+
+    prs = sub.add_parser("result", help="inspect node result records")
+    rsub = prs.add_subparsers(dest="result_cmd", required=True)
+    rsh = rsub.add_parser("show", help="print a node's result record")
+    rsh.add_argument("id")
+    rsh.set_defaults(func=cmd_result_show)
+    rv = rsub.add_parser("verify", help="verify a node's result record against git")
+    rv.add_argument("id")
+    rv.set_defaults(func=cmd_result_verify)
     return p
 
 
