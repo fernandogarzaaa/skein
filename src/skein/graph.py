@@ -55,6 +55,11 @@ VALID_EVENT_TYPES = {
     # only bumps the node's rejected_count, so operators can see
     # contention in `skein log`, `skein status`, and the timeline UI.
     "rejected",
+    # planner (Phase 8): one event per applied draft, anchored at the
+    # reserved "skein-plan" id like shipping's "release". Informational:
+    # no node state is derived; idempotency is checked by scanning the
+    # log for the draft hash.
+    "plan_applied",
 }
 
 # Statuses a human may set directly via node edit / web UI. Terminal and
@@ -626,6 +631,12 @@ def apply_event(nodes: Dict[str, Dict[str, Any]], ev: Dict[str, Any]) -> None:
             return
         node["rejected_count"] = int(node.get("rejected_count") or 0) + 1
         node["version"] += 1
+    elif etype == "plan_applied":
+        # Repo-level event anchored at the reserved "skein-plan" id.
+        # No node state is derived: idempotency is checked by scanning
+        # the log for the draft hash (planner.plan_applied_hashes),
+        # which keeps graph.json free of non-node records.
+        return
     elif etype == "human_interrupt":
         node = nodes.get(nid)
         if node is None or node.get("removed"):
