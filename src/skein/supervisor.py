@@ -301,7 +301,8 @@ def run_node(repo_root: str | Path, node_id: str, holder: str,
         try:
             c.fail_node(repo_root, node_id, holder, claim_token,
                         evidence=[adapter_ev],
-                        error=f"backend timed out after {adapter_timeout}s (holder={holder}); see evidence")
+                        error=f"backend timed out after {adapter_timeout}s (holder={holder}); see evidence",
+                        outcome="timeout")
         except c.ClaimError:
             return {"outcome": "superseded", "adapter_exit": adapter_exit,
                     "node": g.load_graph(repo_root).get(node_id)}
