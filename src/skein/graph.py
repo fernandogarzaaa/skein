@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from . import locks
+from . import redact
 
 SKEIN_DIR = ".skein"
 LOG_NAME = "log.ndjson"
@@ -44,6 +45,10 @@ VALID_EVENT_TYPES = {
     # shipping lifecycle (Phase 5): informational, not fenced lifecycle
     # transitions, so they bypass lifecycle_transition_error
     "shipped", "release",
+    # security audit (Phase 6): redaction hits, sandbox fallbacks,
+    # serve auth failures. Informational like shipped/release: no node
+    # state is derived, so apply_event ignores them.
+    "security",
 }
 
 # Statuses a human may set directly via node edit / web UI. Terminal and
@@ -80,7 +85,8 @@ def config_path(repo_root: str | Path) -> Path:
 
 def default_config() -> Dict[str, Any]:
     return {"default_ttl_seconds": 1800, "heartbeat_interval_seconds": 60,
-            "default_max_retries": 3, "default_retry_backoff_seconds": 60}
+            "default_max_retries": 3, "default_retry_backoff_seconds": 60,
+            "default_sandbox": False}
 
 
 def load_config(repo_root: str | Path) -> Dict[str, Any]:
@@ -677,6 +683,11 @@ def append_event(repo_root: str | Path, actor: str, type: str, node_id: str,
     # paths, and evidence filenames.
     from . import ids as _ids
     _ids.validate_node_id(node_id)
+    # Write-boundary redaction: secrets in prompts, handoffs, error
+    # strings, or evidence commands never reach events.ndjson verbatim.
+    # Already-stored events are never mutated; redaction is deterministic
+    # so synced peers reduce identical payloads.
+    payload, redacted_hits = redact.redact_payload(payload or {})
     with locks.repo_lock(repo_root):
         ev = {
             "event_id": uuid.uuid4().hex,
@@ -703,7 +714,15 @@ def append_event(repo_root: str | Path, actor: str, type: str, node_id: str,
         rebuild_graph(repo_root)
         if commit:
             git_commit_log(repo_root, f"skein: {type} {node_id} by {actor}")
-        return ev
+    if redacted_hits:
+        # Audit the redaction itself: count only, never the secret. The
+        # security payload carries no secret shapes, so this nested
+        # append cannot recurse.
+        append_event(repo_root, actor, "security", node_id,
+                     {"kind": "redaction", "event_type": type,
+                      "redacted_count": redacted_hits},
+                     commit=commit)
+    return ev
 
 
 def _log_fingerprint(repo_root: str | Path) -> Tuple[int, Optional[str], str]:

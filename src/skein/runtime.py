@@ -24,15 +24,69 @@ still Phase 2 roadmap work; this module is its foundation.
 from __future__ import annotations
 
 import os
+import shutil
 import signal
 import subprocess
+import sys
 import threading
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 OUTPUT_CAP_BYTES = 1_000_000  # per-command output cap; the tail is kept
 _DRAIN_CHUNK = 65536
+
+# Sandbox (Phase 6) resource caps applied via prlimit(1) on Linux.
+# Best-effort defense in depth: when prlimit is missing or the platform
+# is not Linux, the run continues unsandboxed with a note, never fails.
+SANDBOX_CPU_SECONDS = 600
+SANDBOX_MAX_AS_BYTES = 8 * 1024 ** 3  # 8 GiB address space
+
+
+def minimal_environ() -> Dict[str, str]:
+    """Allowlist environment for backend processes.
+
+    PATH, HOME, LANG, every SKEIN_* variable, plus SystemRoot on Windows
+    (required for process startup there). Everything else - ambient API
+    keys, session tokens, agent credentials - is deliberately not
+    inherited. Backends that need credentials should receive them via
+    SKEIN_-prefixed variables mapped by their own wrapper.
+    """
+    keep = ("PATH", "HOME", "LANG")
+    env = {k: v for k, v in os.environ.items()
+           if k in keep or k.startswith("SKEIN_")}
+    if os.name == "nt" and "SystemRoot" in os.environ:
+        env["SystemRoot"] = os.environ["SystemRoot"]
+    return env
+
+
+def _sandbox_wrap(cmd, shell: bool) -> Tuple[object, bool, str]:
+    """Wrap cmd in prlimit(1) resource caps on Linux.
+
+    Returns (cmd, shell, note): note is "" when the sandbox applied,
+    otherwise the human-readable reason the run continues unsandboxed.
+    Never raises: the sandbox is defense in depth, the run is the product.
+    """
+    if sys.platform != "linux":
+        return cmd, shell, (
+            "sandbox rlimits need Linux (prlimit); continuing unsandboxed")
+    prlimit = shutil.which("prlimit")
+    if prlimit is None:
+        return cmd, shell, "prlimit not found; continuing unsandboxed"
+    if isinstance(cmd, (list, tuple)):
+        if not cmd:
+            return cmd, shell, ""
+        if shutil.which(cmd[0]) is None:
+            # Missing binary: leave the command alone so execute()'s
+            # normal FileNotFoundError path reports exit 127 with the
+            # real binary name instead of prlimit's error text.
+            return cmd, shell, ""
+        wrapped: object = [prlimit, f"--cpu={SANDBOX_CPU_SECONDS}",
+                           f"--as={SANDBOX_MAX_AS_BYTES}", *list(cmd)]
+    else:
+        wrapped = [prlimit, f"--cpu={SANDBOX_CPU_SECONDS}",
+                   f"--as={SANDBOX_MAX_AS_BYTES}", "sh", "-c", cmd]
+    return wrapped, False, ""
 
 
 class BoundedBuffer:
@@ -192,7 +246,8 @@ def kill_tree(proc: "subprocess.Popen") -> None:
 def spawn_monitored(cmd, cwd: str | Path,
                     stdin_text: Optional[str] = None,
                     shell: bool = False,
-                    merge_streams: bool = False) -> "subprocess.Popen":
+                    merge_streams: bool = False,
+                    env: Optional[Dict[str, str]] = None) -> "subprocess.Popen":
     """Spawn with stdout/stderr on non-blocking pipes, stdin from DEVNULL
     (or fed once from stdin_text), and its own process group on POSIX so
     kill_tree() reaches grandchildren.
@@ -200,6 +255,9 @@ def spawn_monitored(cmd, cwd: str | Path,
     With merge_streams=False (default) stderr gets its own pipe, so
     callers can hand the backend's exact (stdout, stderr, exit_code)
     triple to its output parser; with True, stderr merges into stdout.
+
+    env=None inherits the ambient environment; pass minimal_environ()
+    (or sandbox=True on execute()) to scrub it for backend processes.
 
     The caller owns the poll/drain loop: drain every stream on every
     iteration (see execute()) and kill_tree(proc) to stop.
@@ -213,6 +271,7 @@ def spawn_monitored(cmd, cwd: str | Path,
         stdin=stdin_cfg,
         shell=shell,
         bufsize=0,
+        env=env,
         # Ignored on Windows; on POSIX the child becomes a process-group
         # leader so killpg() can take the whole tree it spawns.
         start_new_session=(os.name == "posix"),
@@ -246,6 +305,9 @@ class ExecutionResult:
     truncated: bool = False
     timed_out: bool = False
     aborted: bool = False
+    # Sandbox note: "" when the sandbox applied (or was not requested);
+    # otherwise the human-readable reason the run continued unsandboxed.
+    sandbox_note: str = ""
 
 
 def execute(cmd, *, cwd: str | Path, timeout: float,
@@ -253,7 +315,9 @@ def execute(cmd, *, cwd: str | Path, timeout: float,
             shell: bool = False,
             should_abort: Optional[Callable[[], bool]] = None,
             poll_interval: float = 0.2,
-            output_cap: int = OUTPUT_CAP_BYTES) -> ExecutionResult:
+            output_cap: int = OUTPUT_CAP_BYTES,
+            env: Optional[Dict[str, str]] = None,
+            sandbox: bool = False) -> ExecutionResult:
     """The one canonical execution path for backends and shell commands.
 
     - Continuous draining of both pipes: no 64KB deadlock.
@@ -263,18 +327,31 @@ def execute(cmd, *, cwd: str | Path, timeout: float,
     - Timeout: the whole process tree is killed, timed_out=True.
     - Missing binary: FileNotFoundError becomes exit 127 with the
       message on stderr, never an exception.
+    - env: explicit environment for the child (None inherits). Backend
+      runs pass minimal_environ() so ambient secrets are not inherited.
+    - sandbox: additionally wrap the command in prlimit(1) CPU/memory
+      caps on Linux (cwd stays the worktree, env is scrubbed). When the
+      sandbox cannot apply, sandbox_note explains why and the run
+      continues unsandboxed; it never fails for lack of sandbox tooling.
 
     Callers apply their own output parsers and human-readable notes on
     top of the raw triple; execute() adds none.
     """
     import time
+    sandbox_note = ""
+    if sandbox:
+        if env is None:
+            env = minimal_environ()
+        cmd, shell, sandbox_note = _sandbox_wrap(cmd, shell)
     try:
-        proc = spawn_monitored(cmd, cwd, stdin_text=stdin_text, shell=shell)
+        proc = spawn_monitored(cmd, cwd, stdin_text=stdin_text, shell=shell,
+                               env=env)
     except FileNotFoundError as e:
         binary = cmd[0] if isinstance(cmd, (list, tuple)) and cmd else cmd
         return ExecutionResult(
             exit_code=127, stdout="",
-            stderr=f"{binary} binary not found: {e}")
+            stderr=f"{binary} binary not found: {e}",
+            sandbox_note=sandbox_note)
     out_buf = BoundedBuffer(cap=output_cap)
     err_buf = BoundedBuffer(cap=output_cap)
     aborted = False
@@ -322,6 +399,7 @@ def execute(cmd, *, cwd: str | Path, timeout: float,
         truncated=out_buf.dropped > 0 or err_buf.dropped > 0,
         timed_out=timed_out,
         aborted=aborted,
+        sandbox_note=sandbox_note,
     )
 
 
