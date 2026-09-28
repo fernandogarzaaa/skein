@@ -1,20 +1,35 @@
-"""Event log, node/edge model, and reduction for Skein v0.1."""
+"""Event log, node/edge model, and reduction for Skein.
+
+Consistency model (local machine): every state transition is serialized
+under the repo-wide control-plane lock (locks.repo_lock), so concurrent
+processes on one machine see atomic read-validate-mutate-append-persist
+transitions. Multi-machine sync via git remains eventual/advisory:
+git alone cannot provide distributed mutual exclusion.
+"""
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import subprocess
+import uuid
 from copy import deepcopy
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
+
+from . import locks
 
 SKEIN_DIR = ".skein"
 LOG_NAME = "log.ndjson"
 GRAPH_NAME = "graph.json"
+META_NAME = "graph.meta.json"
 CONFIG_NAME = "config.json"
+
+# Increment when the event schema changes in a way old readers must detect.
+EVENT_SCHEMA_VERSION = 1
 
 VALID_STATUSES = {
     "unclaimed", "claimed", "in_progress", "blocked",
@@ -26,6 +41,13 @@ VALID_EVENT_TYPES = {
     "claimed", "heartbeat", "released",
     "completed", "failed", "human_interrupt",
 }
+
+# Statuses a human may set directly via node edit / web UI. Terminal and
+# worker-owned states are never set by direct edit: done/failed come only
+# from the fenced supervisor path, claimed/in_progress only from claim.
+MANUAL_STATUSES = {"unclaimed", "blocked", "needs_human"}
+
+CHANGE_POLICIES = {"off", "warn", "strict"}
 
 
 def utcnow_iso() -> str:
@@ -42,6 +64,10 @@ def log_path(repo_root: str | Path) -> Path:
 
 def graph_path(repo_root: str | Path) -> Path:
     return skein_dir(repo_root) / GRAPH_NAME
+
+
+def meta_path(repo_root: str | Path) -> Path:
+    return skein_dir(repo_root) / META_NAME
 
 
 def config_path(repo_root: str | Path) -> Path:
@@ -63,7 +89,9 @@ def new_node(node_id: str, title: str = "", intent: Optional[Dict[str, str]] = N
              depends_on: Optional[List[str]] = None,
              blast_radius: Optional[List[str]] = None,
              backend: str = "claude_code",
-             backend_config: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
+             backend_config: Optional[Dict[str, str]] = None,
+             change_policy: str = "warn",
+             integration_for: Optional[str] = None) -> Dict[str, Any]:
     return {
         "id": node_id,
         "title": title,
@@ -71,10 +99,18 @@ def new_node(node_id: str, title: str = "", intent: Optional[Dict[str, str]] = N
         "intent": intent or {"goal": "", "context": "", "constraints": "", "completion": ""},
         "depends_on": depends_on or [],
         "blast_radius": blast_radius or [],
+        "change_policy": change_policy if change_policy in CHANGE_POLICIES else "warn",
         "backend": backend or "claude_code",
         "backend_config": backend_config or {},
-        "claim": {"holder": None, "claimed_at": None, "ttl_seconds": None, "last_heartbeat": None},
+        # set only on system-created integration nodes: they merge the
+        # parents of `integration_for` and are themselves exempt from the
+        # integration gate in claim eligibility.
+        "integration_for": integration_for,
+        "claim": {"holder": None, "attempt_id": None, "claim_token": None,
+                  "worker_id": None, "node_version": None, "base_branch": None,
+                  "claimed_at": None, "ttl_seconds": None, "last_heartbeat": None},
         "worktree": {"branch": None, "base_branch": None, "path": None},
+        "result": None,
         "handoff_note": None,
         "evidence": [],
         "version": 0,
@@ -82,32 +118,211 @@ def new_node(node_id: str, title: str = "", intent: Optional[Dict[str, str]] = N
     }
 
 
+def _valid_event_shape(ev: Any) -> bool:
+    """Reject malformed events before reduction so one bad line (e.g. a
+    torn write from a crashed append) cannot poison the whole graph."""
+    if not isinstance(ev, dict):
+        return False
+    if ev.get("type") not in VALID_EVENT_TYPES:
+        return False
+    nid = ev.get("node_id")
+    if not isinstance(nid, str) or not nid:
+        return False
+    payload = ev.get("payload")
+    if payload is not None and not isinstance(payload, dict):
+        return False
+    return True
+
+
+def parse_event(line: str) -> Optional[Dict[str, Any]]:
+    """Parse one NDJSON line; return None for malformed lines instead of
+    raising, so callers can skip torn writes from crashed appends."""
+    line = line.strip()
+    if not line:
+        return None
+    try:
+        ev = json.loads(line)
+    except json.JSONDecodeError:
+        return None
+    if not _valid_event_shape(ev):
+        return None
+    return ev
+
+
+def serialize_event(ev: Dict[str, Any]) -> str:
+    return json.dumps(ev, sort_keys=True)
+
+
 def load_events(repo_root: str | Path) -> List[Dict[str, Any]]:
+    """Load events, skipping malformed lines (e.g. a truncated final line
+    from a crashed append) instead of failing the whole repository.
+    Use load_events_diagnostics() when you need the skip count."""
+    events, _ = load_events_diagnostics(repo_root)
+    return events
+
+
+def load_events_diagnostics(repo_root: str | Path) -> Tuple[List[Dict[str, Any]], int]:
     p = log_path(repo_root)
     if not p.exists():
-        return []
+        return [], 0
     events = []
+    skipped = 0
     for line in p.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if line:
-            events.append(json.loads(line))
-    return events
+        ev = parse_event(line)
+        if ev is None:
+            if line.strip():
+                skipped += 1
+            continue
+        events.append(ev)
+    return events, skipped
 
 
 def reduce_events(events: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
     """Reduce event log to current node state.
 
-    Out-of-order-safe for concurrent appends: sort by timestamp
-    (last-write-wins by event timestamp). Ties broken by file order.
+    Deterministic ordering for a given event set: sort by timestamp,
+    then per-repo seq (true local append order, assigned under the
+    control-plane lock), then stable event_id (not file position), so
+    two machines that union the same lines converge to the same state.
+    Wall-clock timestamps are still the primary order key across
+    machines (see README consistency model); seq only breaks
+    same-timestamp ties in real append order locally.
+    """
+    nodes, _ = reduce_events_diagnostics(events)
+    return nodes
+
+
+def reduce_events_diagnostics(
+        events: List[Dict[str, Any]]) -> Tuple[Dict[str, Dict[str, Any]], int]:
+    """Reduce, returning (nodes, rejected_lifecycle_count).
+
+    Lifecycle events that fail the fencing/state-machine check are
+    rejected here too, not just at append time: a stale worker's
+    completion that reaches the log via git sync must not apply.
     """
     ordered = sorted(
         enumerate(events),
-        key=lambda pair: (pair[1].get("timestamp", ""), pair[0]),
+        key=lambda pair: (pair[1].get("timestamp", ""),
+                          pair[1].get("seq", 0),
+                          pair[1].get("event_id", ""),
+                          pair[0]),
     )
     nodes: Dict[str, Dict[str, Any]] = {}
+    rejected = 0
     for _, ev in ordered:
+        if not _valid_event_shape(ev):
+            continue
+        if ev.get("type") in LIFECYCLE_TYPES and lifecycle_transition_error(nodes, ev):
+            rejected += 1
+            continue
         apply_event(nodes, ev)
-    return nodes
+    return nodes, rejected
+
+
+LIFECYCLE_TYPES = frozenset(
+    {"claimed", "heartbeat", "released", "completed", "failed"})
+
+
+def _lease_expired_at(claim: Dict[str, Any], at_ts: Optional[str]) -> bool:
+    """True if the claim's lease had expired at the given event timestamp."""
+    last = claim.get("last_heartbeat") or claim.get("claimed_at")
+    ttl = claim.get("ttl_seconds")
+    if not last or not ttl or not at_ts:
+        return False
+    try:
+        at = datetime.fromisoformat(at_ts)
+        last_dt = datetime.fromisoformat(last)
+        if at.tzinfo is None:
+            at = at.replace(tzinfo=timezone.utc)
+        if last_dt.tzinfo is None:
+            last_dt = last_dt.replace(tzinfo=timezone.utc)
+    except ValueError:
+        return False
+    return (at - last_dt).total_seconds() > float(ttl)
+
+
+def lifecycle_transition_error(nodes: Dict[str, Dict[str, Any]],
+                               ev: Dict[str, Any]) -> Optional[str]:
+    """Return an error string if ev is not a legal fenced lifecycle
+    transition against the reduced state, else None.
+
+    This is the state machine's last line of defense: it runs both in
+    append_event (local writes raise) and in reduce_events (stale or
+    forged events arriving via sync are rejected instead of applied).
+    """
+    etype = ev.get("type")
+    if etype not in LIFECYCLE_TYPES:
+        return None
+    nid = ev.get("node_id")
+    payload = ev.get("payload") or {}
+    node = nodes.get(nid)
+    if node is None or node.get("removed"):
+        return f"lifecycle event '{etype}' for unknown/removed node '{nid}'"
+    claim = node.get("claim") or {}
+    live_token = claim.get("claim_token")
+    live_holder = claim.get("holder")
+
+    if etype == "claimed":
+        if node["status"] != "unclaimed":
+            return (f"cannot claim '{nid}': status is "
+                    f"'{node['status']}', expected 'unclaimed'")
+        return None
+
+    # System-level revocations are exempt from fencing: the reaper (lease
+    # actually expired) and an explicit operator force-release are the
+    # mechanisms that *invalidate* tokens, so they cannot present one.
+    if etype == "released" and (payload.get("expired") or payload.get("forced")):
+        if payload.get("expired"):
+            # Scope the release to the exact attempt the reaper examined:
+            # a newer live attempt (e.g. claimed via sync after the reap
+            # decision) makes this event stale, never a wipe.
+            reaped = payload.get("reaped_attempt_id")
+            live_attempt = claim.get("attempt_id")
+            if reaped and live_attempt and reaped != live_attempt:
+                return (f"reaper release of '{nid}' rejected: targets a "
+                        f"superseded attempt; ownership moved on")
+            # The reaper's decision time (reaped_as_of) may differ from
+            # the event's timestamp; expiry is evaluated at decision time.
+            as_of = payload.get("reaped_as_of") or ev.get("timestamp")
+            if not _lease_expired_at(claim, as_of):
+                return (f"reaper release of '{nid}' rejected: lease was not "
+                        f"expired at the reaper's decision time")
+        if node["status"] not in ("claimed", "in_progress", "needs_human",
+                                  "failed", "blocked"):
+            return (f"cannot release '{nid}': status is "
+                    f"'{node['status']}'")
+        return None
+
+    # Fencing: a token'd attempt is mutated only by its own token.
+    if not live_holder:
+        return f"'{etype}' on '{nid}': no live attempt"
+    if live_token:
+        if payload.get("claim_token") != live_token:
+            return (f"'{etype}' on '{nid}': stale attempt (fencing token "
+                    f"mismatch); ownership moved on")
+    elif payload.get("holder", live_holder) != live_holder:
+        # Legacy tokenless claim: fall back to holder match.
+        return f"'{etype}' on '{nid}': holder mismatch"
+
+    if etype == "heartbeat":
+        if node["status"] not in ("claimed", "in_progress"):
+            return (f"cannot heartbeat '{nid}': status is "
+                    f"'{node['status']}'")
+    elif etype == "released":
+        if node["status"] not in ("claimed", "in_progress", "needs_human"):
+            return (f"cannot release '{nid}': status is "
+                    f"'{node['status']}'")
+    elif etype in ("completed", "failed"):
+        if node["status"] not in ("claimed", "in_progress"):
+            return (f"cannot mark '{etype}' '{nid}': status is "
+                    f"'{node['status']}'")
+    return None
+
+
+def _empty_claim() -> Dict[str, Any]:
+    return {"holder": None, "attempt_id": None, "claim_token": None,
+            "worker_id": None, "node_version": None, "base_branch": None,
+            "claimed_at": None, "ttl_seconds": None, "last_heartbeat": None}
 
 
 def apply_event(nodes: Dict[str, Dict[str, Any]], ev: Dict[str, Any]) -> None:
@@ -126,6 +341,8 @@ def apply_event(nodes: Dict[str, Dict[str, Any]], ev: Dict[str, Any]) -> None:
             blast_radius=payload.get("blast_radius"),
             backend=payload.get("backend", "claude_code"),
             backend_config=payload.get("backend_config"),
+            change_policy=payload.get("change_policy", "warn"),
+            integration_for=payload.get("integration_for"),
         )
         node["version"] = (nodes[nid]["version"] + 1) if nid in nodes else 1
         nodes[nid] = node
@@ -134,9 +351,11 @@ def apply_event(nodes: Dict[str, Dict[str, Any]], ev: Dict[str, Any]) -> None:
         if node is None or node.get("removed"):
             return
         for key in ("title", "depends_on", "blast_radius", "handoff_note", "status",
-                      "backend", "backend_config"):
+                    "backend", "backend_config", "change_policy"):
             if key in payload:
                 node[key] = deepcopy(payload[key])
+        if node.get("change_policy") not in CHANGE_POLICIES:
+            node["change_policy"] = "warn"
         if "intent" in payload and isinstance(payload["intent"], dict):
             for k, v in payload["intent"].items():
                 node["intent"][k] = v
@@ -157,6 +376,12 @@ def apply_event(nodes: Dict[str, Dict[str, Any]], ev: Dict[str, Any]) -> None:
         node["status"] = "claimed"
         node["claim"] = {
             "holder": payload.get("holder"),
+            "attempt_id": payload.get("attempt_id"),
+            "claim_token": payload.get("claim_token"),
+            "worker_id": payload.get("worker_id") or payload.get("holder"),
+            "node_version": payload.get("node_version"),
+            "base_branch": payload.get("worktree", {}).get("base_branch")
+            if isinstance(payload.get("worktree"), dict) else None,
             "claimed_at": ev.get("timestamp"),
             "ttl_seconds": payload.get("ttl_seconds"),
             "last_heartbeat": ev.get("timestamp"),
@@ -177,6 +402,15 @@ def apply_event(nodes: Dict[str, Dict[str, Any]], ev: Dict[str, Any]) -> None:
         node = nodes.get(nid)
         if node is None or node.get("removed"):
             return
+        # A reaper release is scoped to the attempt the reaper examined:
+        # it must never wipe a newer attempt that interleaved (e.g. a
+        # fresh claim via sync that sorts before this event). The
+        # validator rejects such stale events; this guard is defense in
+        # depth for direct apply_event callers.
+        reaped = payload.get("reaped_attempt_id")
+        live_attempt = (node.get("claim") or {}).get("attempt_id")
+        if reaped and live_attempt and reaped != live_attempt:
+            return
         node["status"] = "unclaimed"
         note = payload.get("note")
         if note:
@@ -186,7 +420,7 @@ def apply_event(nodes: Dict[str, Dict[str, Any]], ev: Dict[str, Any]) -> None:
             ) if not payload.get("keep_handoff") else node.get("handoff_note")
             if payload.get("keep_handoff"):
                 pass
-        node["claim"] = {"holder": None, "claimed_at": None, "ttl_seconds": None, "last_heartbeat": None}
+        node["claim"] = _empty_claim()
         node["version"] += 1
     elif etype == "completed":
         node = nodes.get(nid)
@@ -200,7 +434,9 @@ def apply_event(nodes: Dict[str, Dict[str, Any]], ev: Dict[str, Any]) -> None:
         if "worktree" in payload and isinstance(payload["worktree"], dict):
             for k, v in payload["worktree"].items():
                 node["worktree"][k] = v
-        node["claim"] = {"holder": None, "claimed_at": None, "ttl_seconds": None, "last_heartbeat": None}
+        if "result" in payload and isinstance(payload["result"], dict):
+            node["result"] = deepcopy(payload["result"])
+        node["claim"] = _empty_claim()
         node["version"] += 1
     elif etype == "failed":
         node = nodes.get(nid)
@@ -211,7 +447,7 @@ def apply_event(nodes: Dict[str, Dict[str, Any]], ev: Dict[str, Any]) -> None:
             node["evidence"] = deepcopy(payload["evidence"])
         if "error" in payload and payload["error"]:
             node["handoff_note"] = payload["error"]
-        node["claim"] = {"holder": None, "claimed_at": None, "ttl_seconds": None, "last_heartbeat": None}
+        node["claim"] = _empty_claim()
         node["version"] += 1
     elif etype == "human_interrupt":
         node = nodes.get(nid)
@@ -221,10 +457,15 @@ def apply_event(nodes: Dict[str, Dict[str, Any]], ev: Dict[str, Any]) -> None:
         if action == "delete":
             node["removed"] = True
         elif action in ("edit", "reassign"):
-            # edits carried in payload.fields
+            # edits carried in payload.fields. NOTE: a human_interrupt never
+            # applies a status field - a claimed node is parked as
+            # needs_human below, and terminal states are never set by
+            # direct edit (see edits.py). This closes the path where a
+            # human edit could flip a claimed node straight to done,
+            # bypassing verification.
             fields = payload.get("fields") or {}
-            for key in ("title", "depends_on", "blast_radius", "status",
-                          "backend", "backend_config"):
+            for key in ("title", "depends_on", "blast_radius",
+                        "backend", "backend_config"):
                 if key in fields:
                     node[key] = deepcopy(fields[key])
             if "intent" in fields and isinstance(fields["intent"], dict):
@@ -233,54 +474,162 @@ def apply_event(nodes: Dict[str, Dict[str, Any]], ev: Dict[str, Any]) -> None:
             # an interrupt targeting a claimed node parks it for human review
             if node["status"] in ("claimed", "in_progress"):
                 node["status"] = "needs_human"
-                node["claim"] = {"holder": None, "claimed_at": None, "ttl_seconds": None, "last_heartbeat": None}
+                node["claim"] = _empty_claim()
         else:
             if node["status"] in ("claimed", "in_progress"):
                 node["status"] = "needs_human"
-                node["claim"] = {"holder": None, "claimed_at": None, "ttl_seconds": None, "last_heartbeat": None}
+                node["claim"] = _empty_claim()
         node["version"] += 1
+
+
+def _next_seq(repo_root: str | Path) -> int:
+    """Monotonic per-repo sequence assigned under the control-plane lock."""
+    lp = log_path(repo_root)
+    max_seq = 0
+    if lp.exists():
+        for line in lp.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                s = json.loads(line).get("seq")
+            except (ValueError, AttributeError):
+                continue
+            if isinstance(s, int) and s > max_seq:
+                max_seq = s
+    return max_seq + 1
 
 
 def append_event(repo_root: str | Path, actor: str, type: str, node_id: str,
                  payload: Optional[Dict[str, Any]] = None,
                  timestamp: Optional[str] = None,
                  commit: bool = True) -> Dict[str, Any]:
+    """Append one event atomically: the whole read-validate-mutate-append-
+    persist sequence runs under the repo control-plane lock, so concurrent
+    processes on this machine cannot interleave a claim race."""
     if type not in VALID_EVENT_TYPES:
         raise ValueError(f"unknown event type: {type}")
-    ev = {
-        "timestamp": timestamp or utcnow_iso(),
-        "actor": actor,
-        "type": type,
-        "node_id": node_id,
-        "payload": payload or {},
-    }
+    # Fail fast on hostile node ids: they become branch names, worktree
+    # paths, and evidence filenames.
+    from . import ids as _ids
+    _ids.validate_node_id(node_id)
+    with locks.repo_lock(repo_root):
+        ev = {
+            "event_id": uuid.uuid4().hex,
+            "schema_version": EVENT_SCHEMA_VERSION,
+            "seq": _next_seq(repo_root),
+            "timestamp": timestamp or utcnow_iso(),
+            "actor": actor,
+            "type": type,
+            "node_id": node_id,
+            "payload": payload or {},
+        }
+        # The state machine is enforced at write time too: a lifecycle
+        # event that is not a legal fenced transition is rejected before
+        # it ever reaches the log.
+        err = lifecycle_transition_error(load_graph(repo_root), ev)
+        if err:
+            raise ValueError(err)
+        lp = log_path(repo_root)
+        lp.parent.mkdir(parents=True, exist_ok=True)
+        with lp.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(ev) + "\n")
+            f.flush()
+            os.fsync(f.fileno())
+        rebuild_graph(repo_root)
+        if commit:
+            git_commit_log(repo_root, f"skein: {type} {node_id} by {actor}")
+        return ev
+
+
+def _log_fingerprint(repo_root: str | Path) -> Tuple[int, Optional[str], str]:
+    """Cheap log identity: (non-empty line count, last event_id, sha256).
+
+    One pass over raw bytes - no per-line JSON parsing - so load_graph()
+    can validate the snapshot without a full reduction.
+    """
     lp = log_path(repo_root)
-    lp.parent.mkdir(parents=True, exist_ok=True)
-    with lp.open("a", encoding="utf-8") as f:
-        f.write(json.dumps(ev) + "\n")
-    rebuild_graph(repo_root)
-    if commit:
-        git_commit_log(repo_root, f"skein: {type} {node_id} by {actor}")
-    return ev
+    if not lp.exists():
+        return 0, None, hashlib.sha256(b"").hexdigest()
+    raw = lp.read_bytes()
+    digest = hashlib.sha256(raw).hexdigest()
+    last_id: Optional[str] = None
+    count = 0
+    for line in raw.decode("utf-8", errors="replace").splitlines():
+        if not line.strip():
+            continue
+        count += 1
+        last_line = line
+    if count:
+        try:
+            last_id = json.loads(last_line).get("event_id")
+        except (ValueError, AttributeError):
+            last_id = None
+    return count, last_id, digest
+
+
+def _write_atomic(path: Path, text: str) -> None:
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(text, encoding="utf-8")
+    os.replace(tmp, path)
 
 
 def rebuild_graph(repo_root: str | Path) -> Dict[str, Dict[str, Any]]:
-    events = load_events(repo_root)
-    nodes = reduce_events(events)
+    with locks.repo_lock(repo_root):
+        events = load_events(repo_root)
+        nodes = reduce_events(events)
+        gp = graph_path(repo_root)
+        gp.parent.mkdir(parents=True, exist_ok=True)
+        # graph.json is derived; never hand-edited (written only here)
+        visible = {nid: n for nid, n in nodes.items() if not n.get("removed")}
+        text = json.dumps(visible, indent=2, sort_keys=True)
+        _write_atomic(gp, text)
+        count, last_id, digest = _log_fingerprint(repo_root)
+        meta = {
+            "schema_version": EVENT_SCHEMA_VERSION,
+            "event_count": count,
+            "last_event_id": last_id,
+            "log_digest": digest,
+            # bind the snapshot to its own bytes too: a hand-edited or
+            # corrupted graph.json must not be trusted just because the
+            # log is unchanged
+            "graph_digest": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+            "generated_at": utcnow_iso(),
+        }
+        _write_atomic(meta_path(repo_root), json.dumps(meta, indent=2, sort_keys=True))
+        return visible
+
+
+def _snapshot_is_fresh(repo_root: str | Path) -> bool:
     gp = graph_path(repo_root)
-    gp.parent.mkdir(parents=True, exist_ok=True)
-    # graph.json is derived; never hand-edited (written only here)
-    visible = {nid: n for nid, n in nodes.items() if not n.get("removed")}
-    gp.write_text(json.dumps(visible, indent=2, sort_keys=True), encoding="utf-8")
-    return visible
+    mp = meta_path(repo_root)
+    if not (gp.exists() and mp.exists()):
+        return False
+    try:
+        meta = json.loads(mp.read_text(encoding="utf-8"))
+    except (ValueError, OSError):
+        return False
+    if meta.get("schema_version") != EVENT_SCHEMA_VERSION:
+        return False
+    count, last_id, digest = _log_fingerprint(repo_root)
+    if not (meta.get("event_count") == count
+            and meta.get("last_event_id") == last_id
+            and meta.get("log_digest") == digest):
+        return False
+    # the snapshot must also be byte-identical to what the last rebuild
+    # wrote; otherwise rebuild from the log (source of truth)
+    try:
+        graph_digest = hashlib.sha256(gp.read_bytes()).hexdigest()
+    except OSError:
+        return False
+    return meta.get("graph_digest") == graph_digest
 
 
 def load_graph(repo_root: str | Path) -> Dict[str, Dict[str, Any]]:
-    gp = graph_path(repo_root)
-    if gp.exists():
+    if _snapshot_is_fresh(repo_root):
         try:
-            return json.loads(gp.read_text(encoding="utf-8"))
-        except json.JSONDecodeError:
+            return json.loads(graph_path(repo_root).read_text(encoding="utf-8"))
+        except (ValueError, OSError):
             pass
     return rebuild_graph(repo_root)
 
@@ -296,8 +645,10 @@ def git_commit_log(repo_root: str | Path, message: str) -> bool:
                        capture_output=True, check=False)
         # Scope the commit to .skein: a bare `git commit` would sweep in any
         # unrelated user-staged files (observed in a live walkthrough).
-        r = subprocess.run(["git", "commit", "-m", message, "--", SKEIN_DIR],
-                           cwd=str(repo_root), capture_output=True, check=False)
+        r = subprocess.run(
+            ["git", "-c", "user.name=skein", "-c", "user.email=skein@localhost",
+             "commit", "-m", message, "--", SKEIN_DIR],
+            cwd=str(repo_root), capture_output=True, check=False)
         return r.returncode == 0
     except FileNotFoundError:
         return False

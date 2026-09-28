@@ -29,15 +29,23 @@ def add(repo, nid, depends=(), blast=(), **kw):
 
 
 def test_dependency_blocks_claim(repo):
+    import subprocess
     add(repo, "a")
     add(repo, "b", depends=["a"])
     with pytest.raises(c.ClaimError, match="dependency"):
         c.claim_node(repo, "b", "agent-1")
-    # complete dep then claim works
-    g.append_event(repo, "agent-1", "claimed", "a", {"holder": "agent-1", "ttl_seconds": 60})
-    g.append_event(repo, "agent-1", "completed", "a", {"handoff_note": "ok", "evidence": []})
+    # complete dep through the fenced path with a durable result, then
+    # claim works and the child branches from the dep's result commit
+    node = c.claim_node(repo, "a", "agent-1")
+    tok = (node.get("claim") or {})["claim_token"]
+    head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=str(repo),
+                          capture_output=True, text=True).stdout.strip()
+    c.complete_node(repo, "a", "agent-1", tok, handoff_note="ok",
+                    result={"base_commit": head, "commit": head,
+                            "changed_files": [], "diff_stats": {}})
     node = c.claim_node(repo, "b", "agent-1")
     assert node["status"] == "claimed"
+    assert node["claim"]["base_branch"] == head
 
 
 def test_blast_radius_overlap_blocks_claim(repo):
@@ -59,9 +67,10 @@ def test_no_overlap_allows_parallel_claim(repo):
 def test_cas_conflict_rejected(repo):
     add(repo, "a")
     v0 = g.load_graph(repo)["a"]["version"]
-    c.claim_node(repo, "a", "agent-1", expected_version=v0)
-    # stale version now rejected
-    g.append_event(repo, "x", "heartbeat", "a", {})
+    node = c.claim_node(repo, "a", "agent-1", expected_version=v0)
+    token = (node.get("claim") or {})["claim_token"]
+    # a fenced heartbeat with the live token still renews the lease
+    c.heartbeat(repo, "a", "agent-1", claim_token=token)
     v_stale = v0
     with pytest.raises(c.ClaimError, match="version conflict"):
         c.claim_node(repo, "a", "agent-2", expected_version=v_stale)
@@ -81,10 +90,25 @@ def test_dead_agent_reaped(repo):
 
 def test_heartbeat_renews_lease(repo):
     add(repo, "a")
-    c.claim_node(repo, "a", "agent-1", ttl_seconds=3600)
-    c.heartbeat(repo, "a", "agent-1")
+    node = c.claim_node(repo, "a", "agent-1", ttl_seconds=3600)
+    token = (node.get("claim") or {})["claim_token"]
+    c.heartbeat(repo, "a", "agent-1", claim_token=token)
     future = datetime.now(timezone.utc) + timedelta(seconds=60)
     assert c.reap_expired(repo, at=future) == []
+
+
+def test_stale_token_cannot_heartbeat(repo):
+    add(repo, "a")
+    node = c.claim_node(repo, "a", "agent-1", ttl_seconds=3600)
+    token = (node.get("claim") or {})["claim_token"]
+    # wrong token is rejected even though the holder matches
+    with pytest.raises((c.ClaimError, ValueError), match="(?i)stale|token|mismatch"):
+        c.heartbeat(repo, "a", "agent-1", claim_token="deadbeef")
+    # and a raw heartbeat event without the token is rejected at append
+    with pytest.raises(ValueError, match="stale attempt"):
+        g.append_event(repo, "agent-1", "heartbeat", "a", {"holder": "agent-1"})
+    # live token still works
+    c.heartbeat(repo, "a", "agent-1", claim_token=token)
 
 
 def test_force_release_explicit(repo):

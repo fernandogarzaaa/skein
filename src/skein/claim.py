@@ -1,13 +1,29 @@
-"""Claim protocol: CAS claiming, eligibility, TTL/heartbeat, reaper."""
+"""Claim protocol: fenced attempts, eligibility, TTL/heartbeat, reaper.
+
+Execution model: every claim creates one immutable *attempt* identified
+by (attempt_id, claim_token). The claim_token is a fencing token: any
+lifecycle mutation (heartbeat, release, complete, fail) must present the
+token of the currently owning attempt, or it is rejected. This makes the
+stale-worker scenario impossible:
+
+    A claims X (token t1) -> A stalls -> lease expires -> reaper releases
+    -> B claims X (token t2) -> A's late completion presents t1 -> rejected
+
+All transitions run under the repo control-plane lock, so the
+read-validate-mutate-append sequence is atomic across processes on one
+machine (a true local CAS). Git sync across machines stays eventual.
+"""
 
 from __future__ import annotations
 
 import fnmatch
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Dict, List, Optional, Tuple
 
 from . import graph as g
+from . import locks
 
 
 class ClaimError(Exception):
@@ -88,6 +104,17 @@ def eligibility(repo_root: str | Path, node_id: str) -> Tuple[bool, str]:
             return False, f"dependency '{dep}' is missing/removed"
         if d["status"] != "done":
             return False, f"dependency '{dep}' is '{d['status']}', must be 'done'"
+    # Multi-dependency nodes run only on a successfully integrated base:
+    # the integration node is a first-class dependency result. Integration
+    # nodes themselves are exempt (they ARE the integration step).
+    if len(node.get("depends_on", [])) > 1 and not node.get("integration_for"):
+        integ = nodes.get(f"{node_id}__integrate")
+        if integ is None or integ.get("removed"):
+            return False, (f"integration node '{node_id}__integrate' does not "
+                           f"exist yet; run the node via the supervisor first")
+        if integ["status"] != "done":
+            return False, (f"integration node '{node_id}__integrate' is "
+                           f"'{integ['status']}', must be 'done'")
     for other in active_holders(nodes):
         if other["id"] == node_id:
             continue
@@ -110,22 +137,56 @@ def is_expired(node: Dict, at: Optional[datetime] = None) -> bool:
     return (at - last).total_seconds() > float(ttl)
 
 
+def current_claim(repo_root: str | Path, node_id: str) -> Dict:
+    """Return the node's current claim record (may be empty)."""
+    node = g.load_graph(repo_root).get(node_id)
+    if node is None:
+        raise ClaimError(f"unknown node '{node_id}'")
+    return dict(node.get("claim") or {})
+
+
+def _check_fence(node: Dict, node_id: str, claim_token: Optional[str],
+                 op: str) -> Dict:
+    """Enforce the fencing token for lifecycle mutations.
+
+    A worker presenting a stale (or missing) token for an attempt it no
+    longer owns gets a ClaimError instead of mutating the node.
+    """
+    claim = node.get("claim") or {}
+    current = claim.get("claim_token")
+    if not current:
+        raise ClaimError(f"node '{node_id}' has no live attempt to {op}")
+    if not claim_token or claim_token != current:
+        raise ClaimError(
+            f"stale attempt on '{node_id}': cannot {op} (ownership moved on; "
+            f"this worker no longer holds the node)"
+        )
+    return claim
+
+
 def claim_node(repo_root: str | Path, node_id: str, holder: str,
                ttl_seconds: Optional[int] = None,
                expected_version: Optional[int] = None,
                actor: Optional[str] = None,
-               max_retries: int = 3) -> Dict:
-    """Compare-and-swap claim. Rejects write if version moved (expected_version).
+               max_retries: int = 3,
+               worker_id: Optional[str] = None) -> Dict:
+    """Atomic compare-and-swap claim under the control-plane lock.
 
-    Without expected_version, performs a fresh read-check-append; retries on
-    conflict up to max_retries (conflicts arise under concurrent appends).
+    The whole read-check-append transition is serialized, so two
+    processes can no longer both pass the eligibility check and append
+    competing claims. Creates one fenced attempt (attempt_id +
+    claim_token); every later mutation of that attempt must present the
+    token.
     """
     from . import worktree as wt
     cfg = g.load_config(repo_root)
     ttl = ttl_seconds if ttl_seconds is not None else int(cfg.get("default_ttl_seconds", 1800))
     actor = actor or holder
-    attempt = 0
-    while True:
+    worker_id = worker_id or holder
+    # The whole read-check-append runs inside one critical section, so
+    # two contenders cannot both pass eligibility and append: the loser
+    # re-reads under the lock and sees the winner's claim.
+    with locks.repo_lock(repo_root):
         nodes = g.load_graph(repo_root)
         node = nodes.get(node_id)
         if node is None:
@@ -138,64 +199,130 @@ def claim_node(repo_root: str | Path, node_id: str, holder: str,
         ok, reason = eligibility(repo_root, node_id)
         if not ok:
             raise ClaimError(reason)
-        # re-read events to detect a concurrent append racing us
-        fresh = g.rebuild_graph(repo_root)
-        fresh_node = fresh.get(node_id)
-        if fresh_node is None:
-            raise ClaimError(f"unknown node '{node_id}'")
-        if expected_version is not None:
-            if fresh_node["version"] != expected_version:
-                raise ClaimError(
-                    f"version conflict on '{node_id}': expected {expected_version}, "
-                    f"found {fresh_node['version']}"
-                )
-        elif fresh_node["version"] != node["version"]:
-            attempt += 1
-            if attempt >= max_retries:
-                raise ClaimError(f"concurrent modification on '{node_id}', retry failed")
-            continue
+        attempt_id = uuid.uuid4().hex
+        claim_token = uuid.uuid4().hex
         # determine base branch for bookkeeping (worktree created in run path)
-        base = wt.base_branch_for(repo_root, node_id, fresh)
-        ev = g.append_event(
+        try:
+            base = wt.base_branch_for(repo_root, node_id, nodes)
+        except wt.WorktreeError as e:
+            raise ClaimError(str(e))
+        g.append_event(
             repo_root, actor, "claimed", node_id,
-            {"holder": holder, "ttl_seconds": ttl,
+            {"holder": holder, "worker_id": worker_id,
+             "attempt_id": attempt_id, "claim_token": claim_token,
+             "node_version": node["version"],
+             "ttl_seconds": ttl,
              "worktree": {"base_branch": base}},
         )
         return g.load_graph(repo_root)[node_id]
 
 
-def heartbeat(repo_root: str | Path, node_id: str, holder: str) -> Dict:
-    nodes = g.load_graph(repo_root)
-    node = nodes.get(node_id)
-    if node is None:
-        raise ClaimError(f"unknown node '{node_id}'")
-    claim = node.get("claim") or {}
-    if claim.get("holder") != holder:
-        raise ClaimError(f"node '{node_id}' held by '{claim.get('holder')}', not '{holder}'")
-    if node["status"] not in ("claimed", "in_progress"):
-        raise ClaimError(f"node '{node_id}' status '{node['status']}' cannot heartbeat")
-    g.append_event(repo_root, holder, "heartbeat", node_id, {})
-    return g.load_graph(repo_root)[node_id]
+def heartbeat(repo_root: str | Path, node_id: str, holder: str,
+              claim_token: Optional[str] = None,
+              commit: bool = False) -> Dict:
+    """Renew a lease. With claim_token, the heartbeat is fenced: a stale
+    worker whose attempt was reaped/released gets ClaimError instead of
+    silently reviving the lease. Heartbeats are ephemeral liveness, not
+    durable state, so they skip the git commit by default."""
+    with locks.repo_lock(repo_root):
+        nodes = g.load_graph(repo_root)
+        node = nodes.get(node_id)
+        if node is None:
+            raise ClaimError(f"unknown node '{node_id}'")
+        claim = node.get("claim") or {}
+        if claim.get("holder") != holder:
+            raise ClaimError(f"node '{node_id}' held by '{claim.get('holder')}', not '{holder}'")
+        if claim_token is not None:
+            _check_fence(node, node_id, claim_token, "heartbeat")
+        if node["status"] not in ("claimed", "in_progress"):
+            raise ClaimError(f"node '{node_id}' status '{node['status']}' cannot heartbeat")
+        payload = {"holder": holder}
+        if claim_token is not None:
+            payload["claim_token"] = claim_token
+        g.append_event(repo_root, holder, "heartbeat", node_id, payload,
+                       commit=commit)
+        return g.load_graph(repo_root)[node_id]
 
 
 def release_node(repo_root: str | Path, node_id: str, actor: str,
-                 force: bool = False, note: str = "") -> Dict:
-    nodes = g.load_graph(repo_root)
-    node = nodes.get(node_id)
-    if node is None:
-        raise ClaimError(f"unknown node '{node_id}'")
-    if node["status"] not in ("claimed", "in_progress", "needs_human", "failed", "blocked"):
-        raise ClaimError(f"node '{node_id}' status '{node['status']}' is not releasable")
-    if not force and node["status"] in ("claimed", "in_progress"):
-        holder = (node.get("claim") or {}).get("holder")
-        if holder and holder != actor:
+                 force: bool = False, note: str = "",
+                 claim_token: Optional[str] = None) -> Dict:
+    with locks.repo_lock(repo_root):
+        nodes = g.load_graph(repo_root)
+        node = nodes.get(node_id)
+        if node is None:
+            raise ClaimError(f"unknown node '{node_id}'")
+        if node["status"] not in ("claimed", "in_progress", "needs_human", "failed", "blocked"):
+            raise ClaimError(f"node '{node_id}' status '{node['status']}' is not releasable")
+        if not force and node["status"] in ("claimed", "in_progress"):
+            if claim_token is not None:
+                _check_fence(node, node_id, claim_token, "release")
+            else:
+                holder = (node.get("claim") or {}).get("holder")
+                if holder and holder != actor:
+                    raise ClaimError(
+                        f"node '{node_id}' held by '{holder}'; use --force for explicit force-release"
+                    )
+        payload = {"note": note or (f"force-released by {actor}" if force else f"released by {actor}"),
+                   "forced": force,
+                   "holder": (node.get("claim") or {}).get("holder")}
+        if claim_token is not None:
+            payload["claim_token"] = claim_token
+        g.append_event(repo_root, actor, "released", node_id, payload)
+        return g.load_graph(repo_root)[node_id]
+
+
+def complete_node(repo_root: str | Path, node_id: str, actor: str,
+                  claim_token: str,
+                  handoff_note: str = "",
+                  evidence: Optional[List[Dict]] = None,
+                  worktree: Optional[Dict] = None,
+                  result: Optional[Dict] = None) -> Dict:
+    """Fenced completion: only the current attempt's token can mark done."""
+    with locks.repo_lock(repo_root):
+        nodes = g.load_graph(repo_root)
+        node = nodes.get(node_id)
+        if node is None:
+            raise ClaimError(f"unknown node '{node_id}'")
+        if node["status"] not in ("claimed", "in_progress"):
             raise ClaimError(
-                f"node '{node_id}' held by '{holder}'; use --force for explicit force-release"
-            )
-    payload = {"note": note or (f"force-released by {actor}" if force else f"released by {actor}"),
-               "forced": force}
-    g.append_event(repo_root, actor, "released", node_id, payload)
-    return g.load_graph(repo_root)[node_id]
+                f"node '{node_id}' status '{node['status']}' cannot complete")
+        claim = _check_fence(node, node_id, claim_token, "complete")
+        payload = {
+            "handoff_note": handoff_note,
+            "evidence": evidence or [],
+            "attempt_id": claim.get("attempt_id"),
+            "claim_token": claim_token,
+        }
+        if worktree:
+            payload["worktree"] = worktree
+        if result:
+            payload["result"] = result
+        g.append_event(repo_root, actor, "completed", node_id, payload)
+        return g.load_graph(repo_root)[node_id]
+
+
+def fail_node(repo_root: str | Path, node_id: str, actor: str,
+              claim_token: str,
+              evidence: Optional[List[Dict]] = None,
+              error: str = "") -> Dict:
+    """Fenced failure: only the current attempt's token can mark failed."""
+    with locks.repo_lock(repo_root):
+        nodes = g.load_graph(repo_root)
+        node = nodes.get(node_id)
+        if node is None:
+            raise ClaimError(f"unknown node '{node_id}'")
+        if node["status"] not in ("claimed", "in_progress"):
+            raise ClaimError(
+                f"node '{node_id}' status '{node['status']}' cannot fail")
+        claim = _check_fence(node, node_id, claim_token, "fail")
+        g.append_event(repo_root, actor, "failed", node_id, {
+            "evidence": evidence or [],
+            "error": error,
+            "attempt_id": claim.get("attempt_id"),
+            "claim_token": claim_token,
+        })
+        return g.load_graph(repo_root)[node_id]
 
 
 def reap_expired(repo_root: str | Path, actor: str = "reaper",
@@ -203,13 +330,24 @@ def reap_expired(repo_root: str | Path, actor: str = "reaper",
     """Release expired leases. Returns list of released node ids."""
     at = at or now_utc()
     released = []
-    nodes = g.load_graph(repo_root)
-    for nid, node in list(nodes.items()):
-        if node.get("status") in ("claimed", "in_progress") and is_expired(node, at):
-            holder = (node.get("claim") or {}).get("holder")
-            g.append_event(repo_root, actor, "released", nid, {
-                "note": f"lease expired (holder={holder}); previous attempt did not complete",
-                "expired": True,
-            })
-            released.append(nid)
+    with locks.repo_lock(repo_root):
+        nodes = g.load_graph(repo_root)
+        for nid, node in list(nodes.items()):
+            if node.get("status") in ("claimed", "in_progress") and is_expired(node, at):
+                claim = node.get("claim") or {}
+                holder = claim.get("holder")
+                # Event time is now (when the reaper ran). `at` is the
+                # decision input ("expired as of at") and is recorded as
+                # reaped_as_of so the validator evaluates expiry at the
+                # same instant the reaper did. The release is scoped to
+                # the exact attempt examined: a newer attempt that
+                # interleaves later must not be wiped by this event.
+                g.append_event(repo_root, actor, "released", nid, {
+                    "note": f"lease expired (holder={holder}); previous attempt did not complete",
+                    "expired": True,
+                    "reaped_as_of": at.isoformat(),
+                    "reaped_attempt_id": claim.get("attempt_id"),
+                    "reaped_holder": holder,
+                })
+                released.append(nid)
     return released

@@ -35,31 +35,62 @@ def _unmerged_files(repo_root: Any) -> List[str]:
 
 
 def _union_merge_log(repo_root: Any) -> bool:
-    """Resolve a log.ndjson conflict by line union. Returns True if the
-    conflict was confined to .skein/ and resolved."""
+    """Resolve a log.ndjson conflict by event-id union. Returns True only
+    if the conflict is confined to the event log and derived files.
+
+    Anything else under .skein/ (config.json, evidence, ...) is NOT
+    auto-merged: config.json is not line-delimited and a line union would
+    corrupt it. The caller aborts the merge in those cases and tells the
+    user to resolve manually."""
     from . import graph as g
     unmerged = _unmerged_files(repo_root)
     if not unmerged:
         return False
-    if any(not f.startswith(".skein/") for f in unmerged):
+    auto_mergeable = {
+        f"{g.SKEIN_DIR}/{g.LOG_NAME}",
+        f"{g.SKEIN_DIR}/{g.GRAPH_NAME}",
+        f"{g.SKEIN_DIR}/{g.META_NAME}",
+    }
+    if any(f not in auto_mergeable for f in unmerged):
         return False
-    log = g.log_path(repo_root)
-    lines: List[str] = []
-    seen = set()
-    # union across merge stages: ours (:2), theirs (:3), plus base (:1)
+    by_id = {}
+    log_ref = f"{g.SKEIN_DIR}/{g.LOG_NAME}"
+    # Working tree first: carries git's own clean merge for the hunks it
+    # could resolve (conflict markers are skipped).
+    lp = g.log_path(repo_root)
+    if lp.exists():
+        for line in lp.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line or line[:7] in ("<<<<<<<", "=======", ">>>>>>>"):
+                continue
+            ev = g.parse_event(line)
+            if ev is not None:
+                by_id.setdefault(ev["event_id"], line)
     for stage in ("1", "2", "3"):
-        r = _git(repo_root, "show", f":{stage}:{g.SKEIN_DIR}/{g.LOG_NAME}")
+        r = _git(repo_root, "show", f":{stage}:{log_ref}")
         if r.returncode != 0:
             continue
         for line in r.stdout.splitlines():
             line = line.strip()
-            if line and line not in seen:
-                seen.add(line)
-                lines.append(line)
-    log.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
-    g.rebuild_graph(repo_root)
+            if not line:
+                continue
+            ev = g.parse_event(line)
+            if ev is None:
+                continue  # malformed lines are dropped on rebuild anyway
+            by_id.setdefault(ev["event_id"], line)
+    # Deterministic order: sort by (timestamp, seq, event_id) so every
+    # machine converges on the same file content.
+    ordered = sorted(
+        (g.parse_event(l) for l in by_id.values()),
+        key=lambda e: (e.get("timestamp", ""), e.get("seq", 0),
+                       e.get("event_id", "")))
+    lp.write_text(
+        "".join(g.serialize_event(e) + "\n" for e in ordered),
+        encoding="utf-8")
+    g.rebuild_graph(repo_root)  # regenerates graph.json + meta from the log
     _git(repo_root, "add", g.SKEIN_DIR)
-    r = _git(repo_root, "commit", "-m", "skein: sync auto-merge (log union)")
+    r = _git(repo_root, "-c", "user.name=skein", "-c", "user.email=skein@localhost",
+             "commit", "-m", "skein: sync auto-merge (log union)")
     return r.returncode == 0
 
 
@@ -73,7 +104,8 @@ def sync_repo(repo_root: Any, push: bool = True,
         raise ValueError(f"no git remote '{remote}' (nothing to sync with)")
     # checkpoint any uncommitted .skein state first
     _git(repo_root, "add", g.SKEIN_DIR)
-    _git(repo_root, "commit", "-m", "skein: sync checkpoint")
+    _git(repo_root, "-c", "user.name=skein", "-c", "user.email=skein@localhost",
+          "commit", "-m", "skein: sync checkpoint")
     fetched = _git(repo_root, "fetch", remote)
     if fetched.returncode != 0:
         raise ValueError(f"fetch from '{remote}' failed: {fetched.stderr.strip()}")
@@ -89,18 +121,19 @@ def sync_repo(repo_root: Any, push: bool = True,
     merged = _git(repo_root, "merge", "--no-edit", f"{remote}/{branch}")
     if merged.returncode != 0:
         if _union_merge_log(repo_root):
-            detail = "log conflict auto-merged by line union"
+            detail = "log conflict auto-merged by event-id union"
         else:
             _git(repo_root, "merge", "--abort")
             return {"status": "conflict", "pulled": False, "pushed": False,
-                    "detail": "conflict outside .skein/; resolve manually, "
+                    "detail": "conflict outside .skein/log.ndjson; resolve manually, "
                               "then re-run skein sync (merge aborted)"}
     else:
         detail = "fast-forward or clean merge" if "Already up to date" not in (
             merged.stdout or "") else "already up to date"
     g.rebuild_graph(repo_root)
     _git(repo_root, "add", g.SKEIN_DIR)
-    _git(repo_root, "commit", "-m", "skein: sync merge")
+    _git(repo_root, "-c", "user.name=skein", "-c", "user.email=skein@localhost",
+          "commit", "-m", "skein: sync merge")
     pushed = False
     if push:
         r = _git(repo_root, "push", remote, branch)

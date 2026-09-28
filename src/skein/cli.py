@@ -72,10 +72,19 @@ def cmd_init(args) -> int:
         if r.returncode != 0:
             print(f"git init failed: {r.stderr}", file=sys.stderr)
             return 1
-    # git identity (needed for automated log commits)
-    subprocess.run(["git", "config", "user.email", "skein@localhost"],
-                   capture_output=True)
-    subprocess.run(["git", "config", "user.name", "skein"], capture_output=True)
+    # git identity: skein commits carry explicit -c user.name/-c user.email
+    # flags, so we never overwrite the user's repository-local identity.
+    # Only install a fallback when no identity is configured at all.
+    r_email = subprocess.run(["git", "config", "user.email"],
+                             capture_output=True, text=True)
+    r_name = subprocess.run(["git", "config", "user.name"],
+                            capture_output=True, text=True)
+    if not r_email.stdout.strip():
+        subprocess.run(["git", "config", "user.email", "skein@localhost"],
+                       capture_output=True)
+    if not r_name.stdout.strip():
+        subprocess.run(["git", "config", "user.name", "skein"],
+                       capture_output=True)
     sk = Path(root) / ".skein"
     sk.mkdir(exist_ok=True)
     (sk / "worktrees").mkdir(exist_ok=True)
@@ -117,7 +126,8 @@ def cmd_node_add(args) -> int:
                  context=args.context or "", constraints=args.constraints or "",
                  completion=args.completion or "", depends_on=depends,
                  blast_radius=blast, backend=args.backend or "claude_code",
-                 backend_config=backend_config)
+                 backend_config=backend_config,
+                 change_policy=getattr(args, "change_policy", "warn"))
     except ValueError as e:
         print(str(e), file=sys.stderr)
         return 1
@@ -153,6 +163,8 @@ def cmd_node_edit(args) -> int:
         fields["status"] = args.status
     if args.backend is not None:
         fields["backend"] = args.backend
+    if getattr(args, "change_policy", None) is not None:
+        fields["change_policy"] = args.change_policy
     if args.backend_config:
         try:
             extra = parse_backend_config(args.backend_config)
@@ -279,9 +291,22 @@ def cmd_run(args) -> int:
 
 def cmd_release(args) -> int:
     root = find_repo_root()
+    actor = default_actor()
+    token = None
+    if not args.force:
+        # A holder releasing their own claim presents the attempt's
+        # fencing token (read from the local claim record); anyone else
+        # must pass --force for an explicit, logged override.
+        try:
+            claim = c.current_claim(root, args.id)
+        except c.ClaimError:
+            claim = {}
+        if claim.get("holder") == actor:
+            token = claim.get("claim_token")
     try:
-        c.release_node(root, args.id, actor=default_actor(),
-                       force=args.force, note="force-released by human" if args.force else "")
+        c.release_node(root, args.id, actor=actor,
+                       force=args.force, note="force-released by human" if args.force else "",
+                       claim_token=token)
     except c.ClaimError as e:
         print(f"cannot release '{args.id}': {e}", file=sys.stderr)
         return 1
@@ -482,6 +507,8 @@ def build_parser() -> argparse.ArgumentParser:
     pa.add_argument("--backend-config", action="append", default=[],
                     metavar="key=value",
                     help="backend-specific parameters (repeatable); e.g. model=openai/gpt-5 for opencode")
+    pa.add_argument("--change-policy", default="warn", choices=["warn", "strict", "off"],
+                    help="policy for worktree changes outside the blast radius (default warn)")
     pa.set_defaults(func=cmd_node_add)
     pe = nsub.add_parser("edit", help="edit a node (claimed nodes -> human_interrupt)")
     pe.add_argument("id")
@@ -496,6 +523,8 @@ def build_parser() -> argparse.ArgumentParser:
     pe.add_argument("--backend", default=None)
     pe.add_argument("--backend-config", action="append", default=[],
                     metavar="key=value")
+    pe.add_argument("--change-policy", default=None,
+                    choices=["warn", "strict", "off"])
     pe.add_argument("--delete", action="store_true")
     pe.set_defaults(func=cmd_node_edit)
 
