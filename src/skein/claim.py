@@ -17,6 +17,7 @@ machine (a true local CAS). Git sync across machines stays eventual.
 from __future__ import annotations
 
 import fnmatch
+import functools
 import random
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -29,6 +30,42 @@ from . import locks
 
 class ClaimError(Exception):
     pass
+
+
+def _record_rejection(repo_root: str | Path, node_id: str, op: str,
+                      actor: str, reason: str) -> None:
+    """Record a fenced mutation's ClaimError as an informational
+    `rejected` event: op and reason only, never secrets (claim tokens
+    and presented credentials never appear in ClaimError text; the
+    payload writer redacts regardless). Best-effort: a rejection audit
+    must never break the error path itself, so every failure here is
+    swallowed."""
+    try:
+        g.append_event(repo_root, actor or "unknown", "rejected", node_id,
+                       {"op": op, "reason": (reason or "")[:300]},
+                       commit=False)
+    except Exception:
+        pass
+
+
+def _audit_rejections(op: str):
+    """Decorator for fenced mutations: a ClaimError is recorded as a
+    `rejected` event (see _record_rejection) before being re-raised, so
+    stale-token, double-claim, and invalid-transition failures become
+    visible in `skein log`, `skein status`, and the timeline UI instead
+    of vanishing into a caller's stderr."""
+    def deco(fn):
+        @functools.wraps(fn)
+        def wrapper(repo_root, node_id, *args, **kwargs):
+            try:
+                return fn(repo_root, node_id, *args, **kwargs)
+            except ClaimError as e:
+                actor = (kwargs.get("actor") or kwargs.get("holder")
+                         or (args[0] if args else None) or "unknown")
+                _record_rejection(repo_root, node_id, op, str(actor), str(e))
+                raise
+        return wrapper
+    return deco
 
 
 def parse_ts(ts: Optional[str]) -> Optional[datetime]:
@@ -172,6 +209,7 @@ def _check_fence(node: Dict, node_id: str, claim_token: Optional[str],
     return claim
 
 
+@_audit_rejections("claim")
 def claim_node(repo_root: str | Path, node_id: str, holder: str,
                ttl_seconds: Optional[int] = None,
                expected_version: Optional[int] = None,
@@ -224,6 +262,7 @@ def claim_node(repo_root: str | Path, node_id: str, holder: str,
         return g.load_graph(repo_root)[node_id]
 
 
+@_audit_rejections("heartbeat")
 def heartbeat(repo_root: str | Path, node_id: str, holder: str,
               claim_token: Optional[str] = None,
               commit: bool = False) -> Dict:
@@ -251,6 +290,7 @@ def heartbeat(repo_root: str | Path, node_id: str, holder: str,
         return g.load_graph(repo_root)[node_id]
 
 
+@_audit_rejections("release")
 def release_node(repo_root: str | Path, node_id: str, actor: str,
                  force: bool = False, note: str = "",
                  claim_token: Optional[str] = None) -> Dict:
@@ -279,6 +319,7 @@ def release_node(repo_root: str | Path, node_id: str, actor: str,
         return g.load_graph(repo_root)[node_id]
 
 
+@_audit_rejections("complete")
 def complete_node(repo_root: str | Path, node_id: str, actor: str,
                   claim_token: str,
                   handoff_note: str = "",
@@ -321,6 +362,7 @@ def _backoff_with_jitter(base_seconds: float, failures_used: int) -> float:
     return base * (2 ** max(0, failures_used)) * random.uniform(0.75, 1.25)
 
 
+@_audit_rejections("fail")
 def fail_node(repo_root: str | Path, node_id: str, actor: str,
               claim_token: str,
               evidence: Optional[List[Dict]] = None,
