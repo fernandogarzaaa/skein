@@ -78,6 +78,22 @@ def test_run_bounded_caps_output(tmp_path):
     assert len(out) < 3_000_000
 
 
+
+def test_run_bounded_silent_child_times_out(tmp_path):
+    # A child that produces no output must still be killed at the
+    # deadline. Regression test for the Windows pipe-drain wedge:
+    # os.set_blocking() is unreliable for Windows pipes, so the old
+    # drain loop blocked in os.read() on the empty pipe and the timeout
+    # never fired (the 30s sleep ran to completion, exit 0).
+    start = time.monotonic()
+    code, _ = rt.run_bounded(
+        [PY, "-c", "import time; time.sleep(30)"],
+        cwd=str(tmp_path), timeout=2)
+    elapsed = time.monotonic() - start
+    assert code == 124
+    assert elapsed < 15  # killed at the deadline, not after the sleep
+
+
 def test_run_bounded_timeout_kills_tree(tmp_path):
     pidfile = tmp_path / "gc.pid"
     script = (
