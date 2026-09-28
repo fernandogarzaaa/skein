@@ -83,7 +83,7 @@ def test_run_bounded_timeout_kills_tree(tmp_path):
     script = (
         "import subprocess, sys, os, time; "
         f"subprocess.Popen([sys.executable, '-c', "
-        f"\"import os, time; open(r'{pidfile}', 'w').write(str(os.getpid())); "
+        f"\"import os, time; open('{pidfile.as_posix()}', 'w').write(str(os.getpid())); "
         f"time.sleep(120)\"]); "
         "time.sleep(120)"
     )
@@ -98,7 +98,7 @@ def test_run_bounded_timeout_kills_tree(tmp_path):
     while time.monotonic() < deadline:
         try:
             os.kill(pid, 0)
-        except ProcessLookupError:
+        except (ProcessLookupError, OSError):
             break  # grandchild is dead
         time.sleep(0.2)
     else:
@@ -124,7 +124,7 @@ def test_supervisor_timeout_kills_backend_tree(repo):
     script = (
         "import subprocess, sys, os, time; "
         f"subprocess.Popen([sys.executable, '-c', "
-        f"\"import os, time; open(r'{pidfile}', 'w').write(str(os.getpid())); "
+        f"\"import os, time; open('{pidfile.as_posix()}', 'w').write(str(os.getpid())); "
         f"time.sleep(120)\"]); "
         "time.sleep(120)"
     )
@@ -140,7 +140,7 @@ def test_supervisor_timeout_kills_backend_tree(repo):
     while time.monotonic() < deadline:
         try:
             os.kill(pid, 0)
-        except ProcessLookupError:
+        except (ProcessLookupError, OSError):
             break
         time.sleep(0.2)
     else:

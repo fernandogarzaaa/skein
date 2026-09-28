@@ -110,18 +110,27 @@ def kill_tree(proc: "subprocess.Popen") -> None:
             os.killpg(proc.pid, signal.SIGKILL)
         except OSError:
             pass
-    else:  # Windows: no process groups; best effort on the child itself
+    else:
+        # Windows: no process groups. taskkill /T /F takes the whole
+        # tree rooted at the child; fall back to direct terminate/kill
+        # if taskkill is unavailable.
         try:
-            proc.terminate()
-        except OSError:
+            subprocess.run(["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                           capture_output=True, timeout=30)
+        except (OSError, subprocess.SubprocessError):
             pass
-        try:
-            proc.wait(timeout=10)
-        except subprocess.TimeoutExpired:
+        if proc.poll() is None:
             try:
-                proc.kill()
+                proc.terminate()
             except OSError:
                 pass
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                try:
+                    proc.kill()
+                except OSError:
+                    pass
 
 
 def spawn_monitored(cmd, cwd: str | Path,
