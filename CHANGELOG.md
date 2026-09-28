@@ -1,5 +1,47 @@
 # Changelog
 
+## Unreleased (Phase 1: correctness and state-machine invariants)
+
+- Fenced claims: every claim mints an immutable `attempt_id` and
+  `claim_token`; heartbeat, release, complete, and fail must present the
+  live token. Stale attempts (reaped, force-released, superseded) can no
+  longer complete, heartbeat, or revive a lease. Tokenless legacy
+  lifecycle events are rejected at append and during reduction.
+- Human interrupts clear ownership atomically and park the node at
+  `needs_human`; the supervisor no longer force-releases after an
+  interrupt (which used to drag the node back to `unclaimed`).
+- Reaper releases are scoped to the exact attempt examined
+  (`reaped_attempt_id`) and carry the decision time separately
+  (`reaped_as_of`), so a delayed duplicate release cannot wipe a newer
+  claim that landed in between.
+- Durable result commits: verified work is checkpointed as a git commit
+  recording base, result, changed files, diff stats, and attempt id.
+  Downstream worktrees branch from the dependency's result commit, never
+  from an ambient branch. Missing base refs raise
+  `BaseCommitUnavailable` instead of silently substituting the current
+  branch.
+- Integration is now a real fenced attempt: `__integrate` nodes are
+  claimed by `skein-auto-merge`, merge in a temporary worktree, verify,
+  and record a durable result commit. Integration nodes are exempt from
+  recursively requiring their own `__integrate` node.
+- Event log hardening: UUID event ids, schema version, per-repo
+  sequences, fsync on append, malformed/truncated NDJSON recovery,
+  atomic snapshot replacement, deterministic reduction ordering, and a
+  snapshot digest that binds both the log and the generated graph (a
+  corrupted graph.json is rebuilt, not trusted).
+- Repository-wide lock moved to `.git/skein.lock` so it can never be
+  staged through `.skein`; heartbeat git commits are off by default;
+  Skein git commits use command-local identity flags and never touch
+  the user's git config.
+- Execution runtime hardening (`src/skein/runtime.py`): backend stdout
+  is drained continuously (the old read-after-exit design deadlocked
+  past ~64KB), output is capped at 1MB with truncation noted, and
+  aborts/timeouts kill the whole process tree via process groups on
+  POSIX. Verification commands run through the same bounded runner.
+- New regression suites: `tests/test_fencing.py` (fencing, reaping,
+  lifecycle, graph integrity) and `tests/test_runtime.py` (deadlock,
+  output caps, tree kill). 99 tests green.
+
 ## Unreleased (Stage 8: multi-backend adapter engine)
 
 - New profile-driven backend engine: `BackendProfile` data schema +

@@ -13,13 +13,20 @@ How it works:
 - Agents **claim** a node before working it. A claim is a lease with a TTL,
   renewed by heartbeat; if the agent dies, a reaper releases the node back
   to `unclaimed` with a note saying the previous attempt did not complete.
+  Claims are **fenced**: every claim mints an attempt id and claim token,
+  and only the live attempt's holder can heartbeat, complete, fail, or
+  release the node. A stale attempt can never revive a lease or wipe a
+  newer claim.
 - Each claimed node gets its **own git worktree**, branched from its
-  dependency's branch (not always main). Multi-dependency nodes get an
+  dependency's durable result commit (never silently from whatever branch
+  happens to be checked out). Multi-dependency nodes get an
   auto-created **integration node** that deterministically merges the parent
-  branches first.
+  results first, as a real fenced attempt owned by `skein-auto-merge`.
 - Before a node flips to `done`, the supervisor **actually executes** the
   node's `intent.completion` command(s) in the worktree and records exit
   code + output as `evidence`. An agent's self-report is never sufficient.
+  Backend execution is bounded: stdout is drained continuously (no pipe
+  deadlock), output is capped, and aborts kill the whole process tree.
 - On completion the node produces a **handoff note** — a short structured
   summary dependents read instead of the parent's full transcript. This
   **bounds** context growth across a chain of nodes; it does not eliminate

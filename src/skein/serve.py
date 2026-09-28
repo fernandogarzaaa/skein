@@ -99,7 +99,8 @@ class _Handler(BaseHTTPRequestHandler):
                     depends_on=body.get("depends_on", []),
                     blast_radius=body.get("blast_radius", []),
                     backend=str(body.get("backend", "claude_code")),
-                    backend_config=body.get("backend_config", {}))
+                    backend_config=body.get("backend_config", {}),
+                    change_policy=str(body.get("change_policy", "warn")))
             except ValueError as e:
                 return self._send(400, {"error": str(e)})
             return self._send(201, {"node": node})
@@ -115,16 +116,26 @@ class _Handler(BaseHTTPRequestHandler):
                     return self._send(409, {"error": str(e)})
                 return self._send(200, {"node": node})
             if len(parts) == 4 and parts[3] == "release":
+                token = None
+                if not body.get("force", False):
+                    try:
+                        claim = c.current_claim(self._root, node_id)
+                    except c.ClaimError:
+                        claim = {}
+                    if claim.get("holder") == actor:
+                        token = claim.get("claim_token")
                 try:
                     node = c.release_node(self._root, node_id, actor=actor,
-                                          force=bool(body.get("force", False)))
+                                          force=bool(body.get("force", False)),
+                                          claim_token=token)
                 except c.ClaimError as e:
                     return self._send(409, {"error": str(e)})
                 return self._send(200, {"node": node})
             if len(parts) == 3:
                 fields = {k: v for k, v in body.items()
                           if k in ("title", "intent", "depends_on", "blast_radius",
-                                   "status", "backend", "backend_config") and k != "actor"}
+                                   "status", "backend", "backend_config",
+                                   "change_policy") and k != "actor"}
                 try:
                     outcome = edit_node(self._root, actor, node_id, fields,
                                         delete=bool(body.get("delete", False)))

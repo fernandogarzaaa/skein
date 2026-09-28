@@ -36,7 +36,8 @@ def add(repo, nid, depends=(), **kw):
 
 
 def complete_with_branch(repo, nid, holder="a1", content=None, newfile=None):
-    c.claim_node(repo, nid, holder)
+    node = c.claim_node(repo, nid, holder)
+    token = (node.get("claim") or {})["claim_token"]
     path, branch, base = wt.ensure_worktree(repo, nid)
     if content:
         (path / "app.txt").write_text(content)
@@ -48,10 +49,17 @@ def complete_with_branch(repo, nid, holder="a1", content=None, newfile=None):
         subprocess.run(["git", "add", "."], cwd=str(path), capture_output=True)
         subprocess.run(["git", "commit", "-m", f"{nid} work"], cwd=str(path),
                        capture_output=True)
-    g.append_event(repo, holder, "completed", nid,
-                   {"handoff_note": "ok", "evidence": [],
-                    "worktree": {"branch": branch, "base_branch": base,
-                                 "path": str(path)}})
+    # Fenced completion: only the owning attempt's token can mark done,
+    # and the result records the durable commit for downstream bases.
+    result_commit = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=str(path),
+        capture_output=True, text=True).stdout.strip()
+    c.complete_node(repo, nid, holder, token,
+                    handoff_note="ok", evidence=[],
+                    worktree={"branch": branch, "base_branch": base,
+                              "path": str(path)},
+                    result={"base_commit": base, "commit": result_commit,
+                            "changed_files": [], "diff_stats": {}})
     return path, branch
 
 
@@ -59,12 +67,14 @@ def test_base_branch_from_dependency(repo):
     add(repo, "a")
     add(repo, "b", depends=["a"])
     _, branch_a = complete_with_branch(repo, "a", content="from-a\n")
+    dep_commit = g.load_graph(repo)["a"]["result"]["commit"]
     c.claim_node(repo, "b", "a2")
     path_b, branch_b, base_b = wt.ensure_worktree(repo, "b")
-    assert base_b == branch_a
+    # downstream branches from the dep's durable result commit, not the branch name
+    assert base_b == dep_commit
     assert path_b.exists()
-    # worktree really branched from dep branch: contains dep's commit
-    r = subprocess.run(["git", "merge-base", "--is-ancestor", branch_a, branch_b],
+    # worktree really branched from dep result: contains dep's commit
+    r = subprocess.run(["git", "merge-base", "--is-ancestor", dep_commit, branch_b],
                        cwd=str(repo), capture_output=True)
     assert r.returncode == 0
 
