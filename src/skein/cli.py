@@ -18,20 +18,34 @@ from . import claim as c
 from . import worktree as wt
 
 
-def find_repo_root(start: str | Path | None = None) -> str:
-    cur = Path(start or os.getcwd()).resolve()
-    for p in [cur] + list(cur.parents):
-        if (p / ".skein").exists():
-            return str(p)
-    # fall back: containing git repo
+def _git_toplevel(start: Path) -> Path | None:
+    """Containing git repo toplevel for start, or None when there is none."""
     try:
         r = subprocess.run(["git", "rev-parse", "--show-toplevel"],
-                           capture_output=True, text=True, cwd=str(cur))
-        if r.returncode == 0:
-            return r.stdout.strip()
+                           capture_output=True, text=True, cwd=str(start))
     except FileNotFoundError:
-        pass
-    return str(cur)
+        return None
+    if r.returncode != 0:
+        return None
+    return Path(r.stdout.strip()).resolve()
+
+
+def find_repo_root(start: str | Path | None = None) -> str:
+    cur = Path(start or os.getcwd()).resolve()
+    # Never let the upward search escape the containing git repository.
+    # Skein state (.skein/) is committed to git, so a .skein dir outside
+    # the repo (e.g. a user-level ~/.skein, or one belonging to an
+    # unrelated checkout) is a different scope, not the repo being worked
+    # in. Without this boundary, ambient filesystem state silently
+    # hijacks the repo root: commands then run against the wrong graph.
+    git_top = _git_toplevel(cur)
+    for p in [cur] + list(cur.parents):
+        if git_top is not None and not p.is_relative_to(git_top):
+            break
+        if (p / ".skein").exists():
+            return str(p)
+    # fall back: containing git repo (or cwd when there is none)
+    return str(git_top) if git_top is not None else str(cur)
 
 
 def default_actor() -> str:
