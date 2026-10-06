@@ -6,3 +6,6 @@ build/
 dist/
 .skein/worktrees/
 .skein/evidence/
+.env
+.env.*
+.venv/
