@@ -105,7 +105,11 @@ def _git_in(worktree_path: str | Path, *args: str) -> subprocess.CompletedProces
 
 def _changed_files(worktree_path: str | Path) -> List[str]:
     """Files changed in the worktree vs HEAD (tracked + untracked)."""
-    r = _git_in(worktree_path, "status", "--porcelain")
+    # --untracked-files=all: plain --porcelain collapses a new directory to
+    # "dir/", which never matches file globs like "dir/x.py" -- every node
+    # that created a new directory was flagged out of blast radius (and
+    # rejected outright under change_policy=strict).
+    r = _git_in(worktree_path, "status", "--porcelain", "--untracked-files=all")
     files = []
     for line in (r.stdout or "").splitlines():
         path = line[3:].strip() if len(line) > 3 else ""
