@@ -129,11 +129,31 @@ def cmd_init(args) -> int:
     return 0
 
 
+def _split_multi(values) -> list:
+    """Flatten repeatable, comma-separated CLI values.
+
+    `--depends-on a --depends-on b` and `--depends-on a,b` both mean [a, b].
+    Before this, argparse kept only the last occurrence, silently dropping
+    dependencies (and blast-radius globs) when the flag was repeated.
+    """
+    if values is None:
+        return []
+    if isinstance(values, str):
+        values = [values]
+    out = []
+    for v in values:
+        for part in (v or "").split(","):
+            part = part.strip()
+            if part and part not in out:
+                out.append(part)
+    return out
+
+
 def cmd_node_add(args) -> int:
     from .edits import add_node
     root = find_repo_root()
-    depends = [d.strip() for d in (args.depends_on or "").split(",") if d.strip()]
-    blast = [b.strip() for b in (args.blast_radius or "").split(",") if b.strip()]
+    depends = _split_multi(args.depends_on)
+    blast = _split_multi(args.blast_radius)
     try:
         backend_config = parse_backend_config(args.backend_config)
     except ValueError as e:
@@ -178,9 +198,9 @@ def cmd_node_edit(args) -> int:
     if args.completion is not None:
         intent["completion"] = args.completion
     if args.depends_on is not None:
-        fields["depends_on"] = [d.strip() for d in args.depends_on.split(",") if d.strip()]
+        fields["depends_on"] = _split_multi(args.depends_on)
     if args.blast_radius is not None:
-        fields["blast_radius"] = [b.strip() for b in args.blast_radius.split(",") if b.strip()]
+        fields["blast_radius"] = _split_multi(args.blast_radius)
     if args.status is not None:
         fields["status"] = args.status
     if args.backend is not None:
@@ -1061,8 +1081,8 @@ def build_parser() -> argparse.ArgumentParser:
     pa.add_argument("--context", default="")
     pa.add_argument("--constraints", default="")
     pa.add_argument("--completion", default="")
-    pa.add_argument("--depends-on", default="")
-    pa.add_argument("--blast-radius", default="")
+    pa.add_argument("--depends-on", action="append", default=None, help="repeatable and/or comma-separated")
+    pa.add_argument("--blast-radius", action="append", default=None, help="repeatable and/or comma-separated")
     pa.add_argument("--backend", default="claude_code",
                     help="backend profile for this node (see: skein backends list)")
     pa.add_argument("--backend-config", action="append", default=[],
@@ -1083,8 +1103,8 @@ def build_parser() -> argparse.ArgumentParser:
     pe.add_argument("--context", default=None)
     pe.add_argument("--constraints", default=None)
     pe.add_argument("--completion", default=None)
-    pe.add_argument("--depends-on", default=None)
-    pe.add_argument("--blast-radius", default=None)
+    pe.add_argument("--depends-on", action="append", default=None, help="repeatable and/or comma-separated")
+    pe.add_argument("--blast-radius", action="append", default=None, help="repeatable and/or comma-separated")
     pe.add_argument("--status", default=None)
     pe.add_argument("--backend", default=None)
     pe.add_argument("--backend-config", action="append", default=[],
