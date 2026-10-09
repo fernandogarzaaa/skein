@@ -116,3 +116,18 @@ def test_human_interrupt_aborts_supervisor(repo):
     assert outcome.get("outcome") == "interrupted"
     # supervisor must not complete the node after an interrupt
     assert g.load_graph(repo)["n3"]["status"] != "done"
+
+
+def test_node_add_repeated_depends_on_keeps_all(repo):
+    # Repeating --depends-on / --blast-radius used to keep only the last
+    # value (argparse default), silently dropping a dependency.
+    for nid in ("a", "b", "x"):
+        assert skein_main(["node", "add", nid, "--title", nid]) == 0
+    assert skein_main(["node", "add", "c", "--title", "c",
+                       "--depends-on", "a", "--depends-on", "b,x",
+                       "--blast-radius", "src/a/**", "--blast-radius", "src/b/**"]) == 0
+    node = g.load_graph(repo)["c"]
+    assert node["depends_on"] == ["a", "b", "x"]
+    assert node["blast_radius"] == ["src/a/**", "src/b/**"]
+    assert skein_main(["node", "edit", "c", "--depends-on", "a", "--depends-on", "b"]) == 0
+    assert g.load_graph(repo)["c"]["depends_on"] == ["a", "b"]
