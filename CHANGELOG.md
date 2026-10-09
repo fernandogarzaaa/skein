@@ -1,5 +1,22 @@
 # Changelog
 
+## Unreleased (usability + gate hardening)
+
+- Fix: repeating `--depends-on` / `--blast-radius` on `skein node add|edit`
+  silently kept only the last value (dropping dependencies). Both flags
+  are now repeatable and comma-separated.
+- Fix: change-policy checks saw a newly created directory as `dir/`
+  (`git status` collapses untracked dirs), so any node creating a new
+  directory was flagged out of blast radius and rejected under
+  `--change-policy strict`. Untracked files are now listed individually.
+- Fix: Python completion checks no longer leave `__pycache__/` in the
+  worktree (it was committed into result commits and shipped).
+- New: `@nonce` completion directive. The gate exports a random
+  `SKEIN_GATE_NONCE` and requires it on stdout, so solutions that exit 0
+  before any assertion runs are rejected.
+- Tests: loopback HTTP in the serve tests now bypasses `HTTP(S)_PROXY`
+  (19 tests failed on hosts with a proxy configured).
+
 ## Unreleased (Phase 8: planner and automatic DAG generation)
 
 - `skein plan` turns a goal description into a reviewable DAG draft
