@@ -184,6 +184,12 @@ skein sync
   profiles + registry), `engine.py` (generic profile-driven adapter),
   per-backend profile entries
 - `src/skein/cli.py` — the CLI
+- `src/skein/ids.py` — strict node-ID validation, filesystem-safe path resolution
+- `src/skein/locks.py` — cross-process file locking for the control plane
+- `src/skein/planner.py` — goal description to reviewable DAG draft (heuristic or LLM)
+- `src/skein/redact.py` — secret redaction at event/evidence write boundaries
+- `src/skein/runtime.py` — bounded, killable subprocess execution for backends
+- `src/skein/shipping.py` — ship done nodes' result commits, tag releases
 
 ## Backend support matrix
 
