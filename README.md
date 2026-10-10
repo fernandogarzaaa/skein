@@ -97,6 +97,29 @@ skein ship --all            # every done node with a result, in order
 skein release v0.1.0        # annotated tag + release event in the log
 ```
 
+Notes on authoring nodes:
+
+- `--depends-on` and `--blast-radius` accept comma-separated values and
+  can be repeated (`--depends-on a --depends-on b` == `--depends-on a,b`).
+- **Hardening the completion gate with `@nonce`.** An exit code of 0 is
+  forgeable: agent code that calls `sys.exit(0)` / `process.exit(0)` on
+  import ends your test process "successfully" before any assertion
+  runs. Prefix a completion line with `@nonce` and Skein exports a fresh
+  random `SKEIN_GATE_NONCE` for that command and requires it on its own
+  stdout line; print it as the *last* step of your harness, after all
+  assertions:
+
+  ```bash
+  skein node add solve-1 ... --completion "@nonce python check.py"
+  # check.py ends with: print(os.environ["SKEIN_GATE_NONCE"])
+  # (pytest: print it from pytest_sessionfinish when exitstatus == 0)
+  ```
+
+  The nonce is never written to evidence (shown as `<nonce>`); evidence
+  records `nonce_ok`. Code that deliberately reads `SKEIN_GATE_NONCE`
+  can still forge it, so for adversarial agents also keep held-out tests
+  outside the worktree.
+
 While an agent runs, a human editing (or deleting) its node appends a
 `human_interrupt` event and the supervisor terminates the agent process
 gracefully instead of completing:
