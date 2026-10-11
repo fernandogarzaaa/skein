@@ -38,8 +38,14 @@ v0.1 ships exactly one backend adapter: **Claude Code**, invoked headlessly
 ## Install
 
 ```bash
+python3 -m venv .venv
+source .venv/bin/activate   # Windows: .venv\Scripts\activate
 pip install -e .
 ```
+
+Use a virtual environment: on Debian/Ubuntu, installing into the system
+Python is blocked (`externally-managed-environment`). The package has zero
+runtime dependencies, so the install itself is tiny.
 
 This installs the `skein` entrypoint (requires Python ≥ 3.9 and git).
 
@@ -55,14 +61,14 @@ skein node add auth-3 --title "Add session login" \
   --goal "Users can log in with email+password and get a session." \
   --context "Python project, follow existing patterns in src/." \
   --constraints "No new dependencies." \
-  --completion "python -c \"print('login check ok')\"" \
+  --completion "python3 -c \"print('login check ok')\"" \
   --blast-radius "src/auth/**"
 
 skein node add profile-1 --title "Profile page" \
   --goal "Logged-in users see their profile." \
   --context "Python project." \
   --constraints "No new dependencies." \
-  --completion "python -c \"print('profile check ok')\"" \
+  --completion "python3 -c \"print('profile check ok')\"" \
   --depends-on auth-3 --blast-radius "src/profile/**"
 
 skein graph
@@ -70,7 +76,12 @@ skein status
 
 # claim a node (fails cleanly if dependencies aren't done or a
 # blast-radius overlap exists with another claimed node)
+# NOTE: many systems only ship `python3` (no `python`), hence python3 above.
 skein claim auth-3 --agent-id agent-1
+# Actor identity: commands that act on a claim (release, run, ship) check
+# SKEIN_ACTOR against the claim holder. When you claim with --agent-id,
+# export the same id so later commands recognize you:
+export SKEIN_ACTOR=agent-1
 skein release auth-3   # release a claim (only claimed/in-progress nodes)
 
 # full supervised path: claim (if needed) + worktree + backend adapter +
@@ -325,6 +336,8 @@ decide — and `blast_radius` overlap itself is checked heuristically.
 ## Development
 
 ```bash
+python3 -m venv .venv
+source .venv/bin/activate   # Windows: .venv\Scripts\activate
 pip install -e ".[test]"
 python -m pytest
 ```
