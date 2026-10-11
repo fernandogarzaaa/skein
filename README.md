@@ -297,6 +297,40 @@ warning, never a crash. Custom profiles are unverified by default —
 marking one verified is the owner's claim about their own binary,
 stated in its source note.
 
+### Backend network egress under the scrubbed environment
+
+Backends run with a scrubbed environment: `PATH`, `HOME`, `LANG`, and
+`SKEIN_*` variables only. Ambient secrets and proxy settings are
+deliberately not inherited, so on hosts where egress requires a proxy
+a backend that makes HTTPS calls will fail without extra setup.
+
+The supported pattern is the `SKEIN_*` passthrough contract: export the
+values the backend needs with a `SKEIN_` prefix, and map them onto the
+standard names inside your backend wrapper:
+
+```bash
+export SKEIN_HTTPS_PROXY="$https_proxy" SKEIN_HTTP_PROXY="$http_proxy" \
+       SKEIN_NO_PROXY="$no_proxy" SKEIN_ALL_PROXY="$all_proxy"
+export SKEIN_ACTOR=agent-1
+skein run my-node --agent-id agent-1
+```
+
+```python
+# inside the backend wrapper, before any network call:
+for std, sk in (("https_proxy", "SKEIN_HTTPS_PROXY"),
+                ("http_proxy", "SKEIN_HTTP_PROXY"),
+                ("no_proxy", "SKEIN_NO_PROXY"),
+                ("all_proxy", "SKEIN_ALL_PROXY")):
+    if os.environ.get(sk):
+        os.environ[std] = os.environ[sk]
+```
+
+This is proven, not hypothetical: the production-readiness dogfood ran
+a real `pr_auditor` backend (a script calling the GitHub API live for
+PR merge state and check runs) across 5 nodes with exactly this
+mapping. Without the mapping the API calls fail; with it, all 5 nodes
+completed and their evidence verified independently against the API.
+
 ## Backend note (proven against the real CLI)
 
 - Proven with the real `claude` CLI binary (2.1.248) driving a real
