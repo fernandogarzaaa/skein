@@ -45,7 +45,13 @@ pip install -e .
 
 Use a virtual environment: on Debian/Ubuntu, installing into the system
 Python is blocked (`externally-managed-environment`). The package has zero
-runtime dependencies, so the install itself is tiny.
+runtime dependencies, so the install itself is tiny. If `python3 -m venv`
+fails with `ensurepip` errors, install the venv module first:
+`sudo apt install python3-venv` (Debian/Ubuntu).
+
+Windows: use `py -m venv .venv` (or `python -m venv .venv`) and activate
+with `.venv\Scripts\activate`; the `python3` command used in examples below
+becomes `py` (or `python`) on Windows.
 
 This installs the `skein` entrypoint (requires Python ≥ 3.9 and git).
 
