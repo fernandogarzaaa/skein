@@ -195,6 +195,12 @@ def test_execute_abort_kills_tree(tmp_path):
     ticks = []
 
     def abort():
+        # Do not start the abort countdown until the grandchild has written
+        # its pidfile. On a loaded box the two nested interpreter startups
+        # can exceed the old fixed 10-tick (0.5s) budget, aborting before the
+        # grandchild exists and flaking the final pidfile assertion.
+        if not pidfile.exists():
+            return False
         ticks.append(1)
         return len(ticks) > 10  # let the tree start, then abort
 
