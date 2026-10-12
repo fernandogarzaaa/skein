@@ -2,6 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Skein Canvas</title>
 <style>
 body { font-family: sans-serif; margin: 0; display: flex; height: 100vh; }
@@ -15,7 +16,15 @@ header button { cursor: pointer; }
 pre.ev { background: #eee; padding: 6px; max-height: 160px; overflow: auto; font-size: 11px; }
 label { display: block; margin-top: 6px; font-size: 12px; }
 input, textarea, select { width: 100%; box-sizing: border-box; }
-.row { display: flex; gap: 6px; margin-top: 8px; }
+.row { display: flex; gap: 6px; margin-top: 8px; flex-wrap: wrap; }
+.node:focus { outline: none; }
+.node:focus rect { stroke-dasharray: 4 2; stroke-width: 4; }
+#meta.err { color: #ffb3b3; }
+@media (max-width: 760px) {
+  #panes { flex-direction: column; }
+  #main { flex: none; height: 55vh; }
+  #side { min-width: 0; border-left: 0; border-top: 1px solid #ccc; }
+}
 </style>
 </head>
 <body>
@@ -26,20 +35,33 @@ input, textarea, select { width: 100%; box-sizing: border-box; }
 <button onclick="toggleAdd()">+ node</button>
 <button onclick="refresh(true)">refresh</button>
 </header>
-<div style="display:flex;flex:1;min-height:0">
-<div id="main"><svg id="graph" width="1200" height="800"></svg></div>
-<div id="side"><div id="detail"><em>Select a node.</em></div></div>
+<div id="panes" style="display:flex;flex:1;min-height:0">
+<div id="main"><svg id="graph" width="1200" height="800" role="img" aria-label="Task graph"></svg></div>
+<div id="side" aria-live="polite"><div id="detail"><em>Select a node.</em></div></div>
 </div>
 </div>
 <script>
 const COLORS = {unclaimed:"#999", claimed:"#1f77b4", in_progress:"#1f77b4",
   blocked:"#9467bd", needs_human:"#ff7f0e", done:"#2ca02c", failed:"#d62728"};
-let NODES = {}, EVENT_COUNT = 0, SELECTED = null;
+let NODES = {}, EVENT_COUNT = -1, SELECTED = null, ADDING = false;
 
-async function api(method, path, body) {
-  const r = await fetch(path, {method, headers: {"Content-Type": "application/json"},
+// `skein serve --auth-token` gates mutating requests behind a bearer
+// token. The canvas has no login page, so ask once on the first 401 and
+// keep the token for this tab only (sessionStorage, never localStorage).
+function authHeaders() {
+  const t = sessionStorage.getItem("skeinToken");
+  return t ? {"Authorization": "Bearer " + t} : {};
+}
+async function api(method, path, body, retried) {
+  const r = await fetch(path, {method,
+    headers: Object.assign({"Content-Type": "application/json"}, authHeaders()),
     body: body ? JSON.stringify(body) : undefined});
   const data = await r.json().catch(() => ({}));
+  if (r.status === 401 && method !== "GET" && !retried) {
+    const t = prompt("This canvas needs the skein serve auth token (--auth-token / SKEIN_AUTH_TOKEN):");
+    if (t) { sessionStorage.setItem("skeinToken", t.trim()); return api(method, path, body, true); }
+  }
+  if (r.status === 401) sessionStorage.removeItem("skeinToken");
   if (!r.ok) throw new Error(data.error || ("HTTP " + r.status));
   return data;
 }
@@ -64,6 +86,12 @@ function render() {
     layers[d].sort().forEach((id, i) => { pos[id] = {x: 100 + d * 240, y: 60 + i * 100}; });
   });
   const NS = "http://www.w3.org/2000/svg";
+  if (!ids.length) {
+    const t = document.createElementNS(NS, "text");
+    t.setAttribute("x", 24); t.setAttribute("y", 40); t.setAttribute("fill", "#555");
+    t.textContent = "No nodes yet. Use \u201c+ node\u201d or `skein node add` to create one.";
+    svg.appendChild(t);
+  }
   ids.forEach(id => {
     (NODES[id].depends_on || []).forEach(dep => {
       if (!pos[dep]) return;
@@ -88,7 +116,12 @@ function render() {
       '<text text-anchor="middle" y="-6"><tspan font-weight="bold">' + esc(id) + '</tspan></text>' +
       '<text text-anchor="middle" y="10">' + esc((n.title || "").slice(0, 26)) + '</text>' +
       '<text text-anchor="middle" y="24" fill="' + color + '">' + esc(n.status) + '</text>';
-    gEl.onclick = () => { SELECTED = id; render(); showDetail(id); };
+    gEl.setAttribute("tabindex", "0");
+    gEl.setAttribute("role", "button");
+    gEl.setAttribute("aria-label", id + ": " + (n.title || "") + " (" + n.status + ")");
+    const pick = () => { SELECTED = id; ADDING = false; render(); showDetail(id); };
+    gEl.onclick = pick;
+    gEl.onkeydown = e => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); pick(); } };
     svg.appendChild(gEl);
   });
   const maxY = Math.max.apply(null, [400].concat(ids.map(id => pos[id].y + 80)));
@@ -135,8 +168,8 @@ async function saveEdit() {
       title: val("f-title"),
       intent: {goal: val("f-goal"), completion: val("f-completion")},
       status: val("f-status")});
-    msg(r.outcome === "interrupt" ? "human_interrupt recorded; agent claim parked." : "saved.");
     await refresh(true);
+    msg(r.outcome === "interrupt" ? "human_interrupt recorded; agent claim parked." : "saved.");
   } catch (e) { msg("error: " + e.message); }
 }
 async function claimNode() {
@@ -152,11 +185,13 @@ async function deleteNode() {
   if (!confirm("Delete " + SELECTED + "?")) return;
   try {
     const r = await api("POST", "/api/nodes/" + encodeURIComponent(SELECTED), {delete: true});
-    msg(r.outcome === "interrupt_delete" ? "human_interrupt (delete) recorded." : "removed.");
     SELECTED = null; await refresh(true);
+    document.getElementById("detail").innerHTML = "<div id='msg'></div>";
+    msg(r.outcome === "interrupt_delete" ? "human_interrupt (delete) recorded." : "removed.");
   } catch (e) { msg("error: " + e.message); }
 }
 function toggleAdd() {
+  ADDING = true;
   const el = document.getElementById("detail");
   el.innerHTML = "<h3>New node</h3>" +
     "<label>ID <input id='a-id'></label><label>Title <input id='a-title'></label>" +
@@ -172,19 +207,37 @@ async function addNode() {
     await api("POST", "/api/nodes", {id: val("a-id"), title: val("a-title"),
       goal: val("a-goal"), completion: val("a-completion"),
       depends_on: csv("a-dep"), backend: val("a-backend")});
+    ADDING = false; SELECTED = val("a-id");
     await refresh(true);
   } catch (e) { msg("error: " + e.message); }
 }
 
+// The 2 s poll used to rebuild the side panel unconditionally, wiping
+// whatever the user was typing (and the "+ node" form). Now a background
+// poll only re-renders when the event log moved, and never replaces the
+// panel while the add form is open or a field in it has focus.
+function editing() {
+  const a = document.activeElement;
+  return !!(a && document.getElementById("detail").contains(a) &&
+            /^(INPUT|TEXTAREA|SELECT)$/.test(a.tagName));
+}
 async function refresh(force) {
-  const g = await api("GET", "/api/graph");
+  const meta = document.getElementById("meta");
+  let g;
+  try { g = await api("GET", "/api/graph"); }
+  catch (e) { meta.textContent = "cannot reach skein serve: " + e.message; meta.className = "err"; throw e; }
+  meta.className = "";
+  const changed = g.event_count !== EVENT_COUNT;
   NODES = g.nodes; EVENT_COUNT = g.event_count;
-  document.getElementById("meta").textContent = Object.keys(NODES).length + " nodes, " + EVENT_COUNT + " events";
+  meta.textContent = Object.keys(NODES).length + " nodes, " + EVENT_COUNT + " events";
+  if (!force && !changed) return;
   render();
+  if (ADDING || (!force && editing())) return;
   if (SELECTED && NODES[SELECTED]) showDetail(SELECTED);
+  else if (SELECTED) { SELECTED = null; document.getElementById("detail").innerHTML = "<em>Select a node.</em>"; }
 }
 setInterval(() => refresh(false).catch(() => {}), 2000);
-refresh(true);
+refresh(true).catch(() => {});
 </script>
 </body>
 </html>

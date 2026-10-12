@@ -1,6 +1,32 @@
 # Changelog
 
-## Unreleased (usability + gate hardening)
+## 0.3.0 - 2026-10-13
+
+First tagged release since 0.2.0. Rolls up Phases 1-8 and the usability
+fixes below (each listed in its own subsection).
+
+### Canvas (`skein serve`) fixes
+- The 2 s background poll no longer rebuilds the side panel while you
+  are typing in it or while the "+ node" form is open (edits and the
+  add form used to be wiped every two seconds). The graph only
+  re-renders when the event log actually changed.
+- The canvas works with `skein serve --auth-token`: on the first 401 it
+  asks for the token once and keeps it for the tab (sessionStorage), so
+  save/claim/release/delete no longer fail silently on authenticated
+  servers.
+- "saved." / "removed." status messages are shown after the refresh
+  instead of being erased by it.
+- Empty-graph and server-unreachable states; nodes are keyboard
+  focusable (Tab, Enter/Space) with accessible labels; viewport meta
+  and a stacked layout on narrow screens.
+
+### Packaging
+- `requires-python` is now `>=3.10` (CI only tests 3.10-3.12, and the
+  security-patched pytest 9.0.3+ needs 3.10). Test extra pins
+  `pytest>=9.0.3`; uv.lock refreshed. This also unblocks the failing
+  Dependabot uv security update.
+
+### usability + gate hardening
 
 - Fix: repeating `--depends-on` / `--blast-radius` on `skein node add|edit`
   silently kept only the last value (dropping dependencies). Both flags
@@ -17,7 +43,7 @@
 - Tests: loopback HTTP in the serve tests now bypasses `HTTP(S)_PROXY`
   (19 tests failed on hosts with a proxy configured).
 
-## Unreleased (Phase 8: planner and automatic DAG generation)
+### Phase 8: planner and automatic DAG generation
 
 - `skein plan` turns a goal description into a reviewable DAG draft
   (`src/skein/planner.py`). Planning is read-only: nothing touches the
@@ -55,7 +81,7 @@
   task text and the goal; node ids are slugified from titles with
   `-2`/`-3` disambiguation and always pass id validation.
 
-## Unreleased (Phase 7: UI and observability)
+### Phase 7: UI and observability
 
 - Lifecycle rejections are now visible: fenced mutations that raise
   (`claim`, `heartbeat`, `release`, `complete`, `fail`) record an
@@ -80,7 +106,7 @@
 - `gc_worktrees()` was refactored to share its scan with doctor
   through `find_orphaned_worktrees()`; removal behavior unchanged.
 
-## Unreleased (Phase 6: security and sandboxing)
+### Phase 6: security and sandboxing
 
 - Secret redaction at write boundaries (`src/skein/redact.py`):
   `redact_secrets()` masks AWS keys (`AKIA...`), GitHub tokens
@@ -123,7 +149,7 @@
   redacted at the write boundary, so backend auth belongs in the
   environment, not in node intent.
 
-## Unreleased (Phase 5: integration and shipping lifecycle)
+### Phase 5: integration and shipping lifecycle
 
 - `skein ship <node-id> [--to <branch>] [--ff-only] [--force]`: merges a
   done node's recorded result commit into the target branch (default:
@@ -175,7 +201,7 @@
   the same functions: `POST /api/nodes/<id>/ship`,
   `POST /api/release`, and read-only shipped state in `/api/graph`.
 
-## Unreleased (Phase 4: scheduler and retries)
+### Phase 4: scheduler and retries
 
 - Per-node retry policy: `skein node add --max-retries N
   --retry-backoff-seconds S` stores the policy on the node
@@ -212,7 +238,7 @@
   fields (`max_retries`, `retry_backoff_seconds`, `retry_at`,
   `attempts_used`, `attempts`).
 
-## Unreleased (Phase 3: worktree and result-commit model)
+### Phase 3: worktree and result-commit model
 
 - Node deletion owns the worktree lifecycle: `skein node delete <id>`
   removes the node's registered worktree through the same `edit_node`
@@ -244,7 +270,7 @@
   the recorded diff stats match a recomputed numstat. A missing result
   record is an error, not an empty pass.
 
-## Unreleased (Phase 2: canonical execution runtime)
+### Phase 2: canonical execution runtime
 
 - One execution path: `runtime.execute()` is now the single
   spawn/drain/kill implementation used by the supervisor, the verifier,
@@ -266,7 +292,7 @@
   forward-slash pidfile paths (the old `r'C:\...'` embedding was a
   `SyntaxError` on Windows via the `\U` escape).
 
-## Unreleased (Phase 1: correctness and state-machine invariants)
+### Phase 1: correctness and state-machine invariants
 
 - Fenced claims: every claim mints an immutable `attempt_id` and
   `claim_token`; heartbeat, release, complete, and fail must present the
@@ -308,7 +334,7 @@
   lifecycle, graph integrity) and `tests/test_runtime.py` (deadlock,
   output caps, tree kill). 99 tests green.
 
-## Unreleased (Stage 8: multi-backend adapter engine)
+### Stage 8: multi-backend adapter engine
 
 - New profile-driven backend engine: `BackendProfile` data schema +
   generic `ProfileAdapter`; adding a backend is now a profile entry,
