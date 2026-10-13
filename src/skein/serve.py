@@ -306,6 +306,17 @@ def _health_dict(root: str) -> Dict[str, Any]:
             "worktree_root_writable": wt_ok, "version": SKEIN_VERSION}
 
 
+_LOOPBACK_NAMES = ("127.0.0.1", "::1", "localhost")
+
+
+def _host_name(host_header: str) -> str:
+    """Hostname part of a Host header, without port or IPv6 brackets."""
+    h = (host_header or "").strip().lower()
+    if h.startswith("["):
+        return h[1:h.find("]")] if "]" in h else h[1:]
+    return h.rsplit(":", 1)[0] if h.count(":") == 1 else h
+
+
 class _Handler(BaseHTTPRequestHandler):
     server_version = "SkeinCanvas/1.0"
 
@@ -388,9 +399,42 @@ class _Handler(BaseHTTPRequestHandler):
         self._send(401, {"error": "missing or invalid Authorization Bearer token"})
         return False
 
+    def _host_allowed(self) -> bool:
+        """DNS-rebinding guard. A server bound to loopback only answers
+        requests whose Host header names loopback; a page on an attacker
+        domain that re-resolves to 127.0.0.1 is refused (403)."""
+        bound = str(self.server.server_address[0])
+        if bound not in _LOOPBACK_NAMES:
+            return True  # deliberate LAN bind (token-gated); Host varies
+        host = _host_name(self.headers.get("Host", ""))
+        if host in _LOOPBACK_NAMES:
+            return True
+        self._send(403, {"error": "forbidden Host header"})
+        return False
+
+    def _same_origin_json(self) -> bool:
+        """CSRF guard for mutations. A page on another origin can send a
+        "simple" cross-site POST (text/plain or form body) without a CORS
+        preflight; requiring application/json forces a preflight this
+        server never approves, and a foreign Origin is refused outright."""
+        origin = self.headers.get("Origin")
+        if origin is not None:
+            netloc = urlparse(origin).netloc.lower()
+            if not netloc or netloc != (self.headers.get("Host") or "").lower():
+                self._send(403, {"error": "cross-origin request refused"})
+                return False
+        ctype = (self.headers.get("Content-Type") or "").split(";")[0]
+        if ctype.strip().lower() != "application/json":
+            self._send(415, {"error": "Content-Type must be application/json"})
+            return False
+        return True
+
     def _mutation_preamble(self) -> bool:
-        """Shared gate for POST/PUT/DELETE: rate limit, body cap, auth."""
+        """Shared gate for POST/PUT/DELETE: rate limit, Host/Origin and
+        content-type checks, body cap, auth."""
         if not self._check_rate_limit():
+            return False
+        if not self._host_allowed() or not self._same_origin_json():
             return False
         if self._content_length() > _MAX_BODY_BYTES:
             self._send(413, {"error": "request body too large (limit 1 MB)"})
@@ -399,6 +443,8 @@ class _Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if not self._check_rate_limit():
+            return
+        if not self._host_allowed():
             return
         from . import graph as g
         parsed = urlparse(self.path)
