@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.3.1 - 2026-10-13
+
 ### Security
 - `skein serve` without `--auth-token` accepted cross-site requests: any web
   page open in the same browser could POST a text/plain body to

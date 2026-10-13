@@ -134,7 +134,7 @@ def test_health_endpoint(server):
     assert data["git"] is True
     assert data["log_writable"] is True
     assert data["worktree_root_writable"] is True
-    assert data["version"] == "0.3.0"
+    assert data["version"] == "0.3.1"
     assert data["repo"]
 
 
