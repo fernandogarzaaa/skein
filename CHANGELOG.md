@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+
+### Security
+- `skein serve` without `--auth-token` accepted cross-site requests: any web
+  page open in the same browser could POST a text/plain body to
+  `http://127.0.0.1:<port>/api/nodes` (no CORS preflight needed) and add or
+  edit nodes, including `completion` lines that `skein run` later executes.
+  A DNS-rebinding page could also read the graph. Mutations now require
+  `Content-Type: application/json` and a same-origin (or absent) `Origin`
+  header, and a loopback-bound server answers only `Host: localhost /
+  127.0.0.1 / [::1]`. The canvas already sends JSON from its own origin, so
+  nothing changes for normal use.
+
 ## 0.3.0 - 2026-10-13
 
 First tagged release since 0.2.0. Rolls up Phases 1-8 and the usability

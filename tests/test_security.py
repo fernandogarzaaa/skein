@@ -492,3 +492,46 @@ def test_log_shows_security_events(repo, capsys):
     out = capsys.readouterr().out
     assert "security" in out
     assert "serve_auth_failure" in out
+
+
+# --- CSRF / DNS-rebinding guards on the canvas server ---------------------
+
+
+def _raw(method, url, body=b"{}", headers=None):
+    req = urllib.request.Request(url, data=body, method=method,
+                                 headers=headers or {})
+    try:
+        with urllib.request.urlopen(req, timeout=10) as r:
+            return r.status
+    except urllib.error.HTTPError as e:
+        return e.code
+
+
+def test_cross_site_simple_post_refused(server):
+    # what a malicious web page can send without a CORS preflight; a node's
+    # `completion` lines are executed by `skein run`, so this matters.
+    body = json.dumps({"id": "csrf", "completion": "touch /tmp/pwned"}).encode()
+    assert _raw("POST", server + "/api/nodes", body,
+                {"Content-Type": "text/plain"}) == 415
+    assert _raw("POST", server + "/api/nodes", body,
+                {"Content-Type": "application/json",
+                 "Origin": "http://evil.example"}) == 403
+    assert _raw("POST", server + "/api/nodes", body,
+                {"Content-Type": "application/json", "Origin": "null"}) == 403
+    _, graph = _call("GET", server + "/api/graph")
+    assert "csrf" not in graph["nodes"]
+
+
+def test_same_origin_canvas_post_allowed(server):
+    host = server.split("//", 1)[1]
+    body = json.dumps({"id": "ok1", "title": "t"}).encode()
+    assert _raw("POST", server + "/api/nodes", body,
+                {"Content-Type": "application/json; charset=utf-8",
+                 "Origin": "http://" + host}) == 201
+
+
+def test_rebound_host_header_refused(server):
+    assert _raw("GET", server + "/api/graph", None,
+                {"Host": "attacker.example:80"}) == 403
+    assert _raw("GET", server + "/api/graph", None,
+                {"Host": "localhost"}) == 200
