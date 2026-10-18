@@ -38,6 +38,7 @@ v0.1 ships exactly one backend adapter: **Claude Code**, invoked headlessly
 ## Install
 
 ```bash
+python3 --version  # must be 3.11 or newer
 python3 -m venv .venv
 source .venv/bin/activate   # Windows: .venv\Scripts\activate
 pip install -e .
