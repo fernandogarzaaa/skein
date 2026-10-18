@@ -53,7 +53,7 @@ Windows: use `py -m venv .venv` (or `python -m venv .venv`) and activate
 with `.venv\Scripts\activate`; the `python3` command used in examples below
 becomes `py` (or `python`) on Windows.
 
-This installs the `skein` entrypoint (requires Python ≥ 3.10 and git).
+This installs the `skein` entrypoint (requires Python ≥ 3.11 and git).
 
 ## Usage walkthrough
 
