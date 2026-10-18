@@ -38,6 +38,7 @@ v0.1 ships exactly one backend adapter: **Claude Code**, invoked headlessly
 ## Install
 
 ```bash
+python3 --version  # must be 3.11 or newer
 python3 -m venv .venv
 source .venv/bin/activate   # Windows: .venv\Scripts\activate
 pip install -e .
@@ -53,7 +54,7 @@ Windows: use `py -m venv .venv` (or `python -m venv .venv`) and activate
 with `.venv\Scripts\activate`; the `python3` command used in examples below
 becomes `py` (or `python`) on Windows.
 
-This installs the `skein` entrypoint (requires Python ≥ 3.10 and git).
+This installs the `skein` entrypoint (requires Python ≥ 3.11 and git).
 
 ## Usage walkthrough
 
