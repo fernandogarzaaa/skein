@@ -1,4 +1,4 @@
-# Skein v0.2 — parallel task-graph orchestration for coding agents
+# Skein v0.3.1 — parallel task-graph orchestration for coding agents
 
 Skein lets multiple coding agents claim and work nodes of a shared task
 graph in parallel without stepping on each other, using git worktrees for
@@ -32,7 +32,7 @@ How it works:
   **bounds** context growth across a chain of nodes; it does not eliminate
   context degradation.
 
-v0.1 ships exactly one backend adapter: **Claude Code**, invoked headlessly
+v0.1 shipped exactly one backend adapter: **Claude Code**, invoked headlessly
 (`claude --print`) against the node's worktree.
 
 ## Install
