@@ -364,6 +364,52 @@ def test_run_all_multi_dep_runs_integration_node(cli_repo, capsys):
     assert nodes["kid"]["status"] == "done"
 
 
+def test_run_multi_dep_before_parents_done_then_retry(cli_repo, capsys):
+    # an early `run kid` must not create kid__integrate: its auto-merge
+    # would run before the parents exist and is never retried, leaving
+    # kid blocked on an integration node nobody merges
+    from skein.cli import main as skein_main
+    repo, _ = cli_repo
+    for nid in ("p1", "p2"):
+        assert skein_main(["node", "add", nid, "--backend", "okstub",
+                           "--completion", "true"]) == 0
+    assert skein_main(["node", "add", "kid", "--backend", "okstub",
+                       "--depends-on", "p1,p2", "--completion", "true"]) == 0
+    assert skein_main(["run", "kid"]) == 1
+    assert "kid__integrate" not in g.load_graph(str(repo))
+    assert skein_main(["run", "p1"]) == 0
+    assert skein_main(["run", "p2"]) == 0
+    assert skein_main(["run", "kid"]) == 0
+    nodes = g.load_graph(str(repo))
+    assert nodes["kid__integrate"]["status"] == "done"
+    assert nodes["kid"]["status"] == "done"
+
+
+def test_run_stale_integration_node_merges_without_nesting(cli_repo, capsys):
+    # an integration node created before its parents finished (older
+    # graphs) is completed by running it directly: deterministic merge,
+    # never a nested __integrate__integrate node
+    from skein import worktree as wt
+    from skein.cli import main as skein_main
+    repo, _ = cli_repo
+    for nid in ("p1", "p2"):
+        assert skein_main(["node", "add", nid, "--backend", "okstub",
+                           "--completion", "true"]) == 0
+    assert skein_main(["node", "add", "kid", "--backend", "okstub",
+                       "--depends-on", "p1,p2", "--completion", "true"]) == 0
+    assert wt.ensure_integration_node(str(repo), "kid") == "kid__integrate"
+    assert skein_main(["run", "p1"]) == 0
+    assert skein_main(["run", "p2"]) == 0
+    assert skein_main(["run", "kid"]) == 1
+    assert "kid__integrate" in capsys.readouterr().err
+    assert skein_main(["run", "kid__integrate"]) == 0
+    assert skein_main(["run", "kid"]) == 0
+    nodes = g.load_graph(str(repo))
+    assert "kid__integrate__integrate" not in nodes
+    assert nodes["kid__integrate"]["status"] == "done"
+    assert nodes["kid"]["status"] == "done"
+
+
 def test_run_needs_id_or_all(cli_repo, capsys):
     from skein.cli import main as skein_main
     assert skein_main(["run"]) == 1
