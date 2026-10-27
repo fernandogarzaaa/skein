@@ -254,6 +254,16 @@ def test_minimal_environ_allowlist(monkeypatch):
     assert "PATH" in env
 
 
+def test_minimal_environ_keeps_login_identity(monkeypatch):
+    # claude on macOS finds its keychain login through USER; without it
+    # the claude_code backend reports "Not logged in"
+    monkeypatch.setenv("USER", "alice")
+    monkeypatch.setenv("LOGNAME", "alice")
+    env = rt.minimal_environ()
+    assert env.get("USER") == "alice"
+    assert env.get("LOGNAME") == "alice"
+
+
 def test_execute_env_scrubbed(tmp_path, monkeypatch):
     monkeypatch.setenv("PHASE6_JUNK", "should-not-pass")
     r = rt.execute(
