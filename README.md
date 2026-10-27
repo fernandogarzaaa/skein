@@ -300,7 +300,7 @@ stated in its source note.
 
 ### Backend network egress under the scrubbed environment
 
-Backends run with a scrubbed environment: `PATH`, `HOME`, `LANG`, and
+Backends run with a scrubbed environment: `PATH`, `HOME`, `LANG`, `USER`, `LOGNAME`, and
 `SKEIN_*` variables only. Ambient secrets and proxy settings are
 deliberately not inherited, so on hosts where egress requires a proxy
 a backend that makes HTTPS calls will fail without extra setup.

@@ -46,13 +46,14 @@ SANDBOX_MAX_AS_BYTES = 8 * 1024 ** 3  # 8 GiB address space
 def minimal_environ() -> Dict[str, str]:
     """Allowlist environment for backend processes.
 
-    PATH, HOME, LANG, every SKEIN_* variable, plus SystemRoot on Windows
+    PATH, HOME, LANG, USER, LOGNAME (claude finds its macOS keychain
+    login through USER), every SKEIN_* variable, plus SystemRoot on Windows
     (required for process startup there). Everything else - ambient API
     keys, session tokens, agent credentials - is deliberately not
     inherited. Backends that need credentials should receive them via
     SKEIN_-prefixed variables mapped by their own wrapper.
     """
-    keep = ("PATH", "HOME", "LANG")
+    keep = ("PATH", "HOME", "LANG", "USER", "LOGNAME")
     env = {k: v for k, v in os.environ.items()
            if k in keep or k.startswith("SKEIN_")}
     if os.name == "nt" and "SystemRoot" in os.environ:
