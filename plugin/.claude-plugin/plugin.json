@@ -1,0 +1,8 @@
+{
+  "name": "skein",
+  "version": "0.3.1",
+  "description": "Slash commands and an orchestration skill for running skein task DAGs with parallel coding agents.",
+  "author": {"name": "fernandogarzaaa"},
+  "repository": "https://github.com/fernandogarzaaa/skein",
+  "license": "MIT"
+}

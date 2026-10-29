@@ -160,6 +160,22 @@ reap opportunistically):
 skein reap
 ```
 
+## Claude Code plugin
+
+Slash commands and an orchestration skill for Claude Code. The `skein` CLI must be on your PATH.
+
+```
+/plugin marketplace add fernandogarzaaa/skein
+/plugin install skein@skein
+```
+
+- `/skein:status` summarises the graph per node, most actionable first.
+- `/skein:run [N]` runs N agents in parallel (default 3) with the dashboard.
+- `/skein:ship [branch]` merges done nodes onto the current feature branch.
+- `/skein:dashboard` starts the live canvas at http://127.0.0.1:8765/.
+
+The model-invoked `orchestrate` skill turns a work-units table into nodes. See `plugin/README.md`.
+
 ## Web canvas
 
 `skein serve` starts a live graph view with human editing in the

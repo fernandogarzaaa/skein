@@ -1,0 +1,11 @@
+{
+  "name": "skein",
+  "owner": {"name": "fernandogarzaaa"},
+  "plugins": [
+    {
+      "name": "skein",
+      "source": "./plugin",
+      "description": "Slash commands and an orchestration skill for running skein task DAGs with parallel coding agents."
+    }
+  ]
+}

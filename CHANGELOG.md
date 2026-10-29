@@ -3,6 +3,13 @@
 ## Unreleased
 
 ### Added
+- **Claude Code plugin** (`plugin/`, marketplace manifest in
+  `.claude-plugin/`): `/skein:status`, `/skein:run`, `/skein:ship` and
+  `/skein:dashboard` commands plus a model-invoked `orchestrate` skill
+  that maps a work-units table onto `skein node add`. Install with
+  `/plugin marketplace add fernandogarzaaa/skein` then
+  `/plugin install skein@skein`. `tests/test_plugin.py` checks that every
+  `skein` invocation in the plugin markdown matches the real parser.
 - **Skills** (`skein skills`): agents and humans save reusable procedures
   as executable scripts under `.skein/skills/` and later agents run them
   instead of re-deriving the steps. Prompts carry one line per skill
