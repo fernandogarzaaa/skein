@@ -295,6 +295,13 @@ def run_node(repo_root: str | Path, node_id: str, holder: str,
     node_for_adapter["intent"] = dict(node.get("intent", {}))
     if handoffs:
         node_for_adapter["intent"]["parent_handoffs"] = handoffs
+    # Skill index: one line per skill from the registry, never the script
+    # bodies, so the prompt cost stays flat as the library grows.
+    try:
+        from . import skills as sk
+        node_for_adapter["skills_index"] = sk.prompt_block(repo_root, node)
+    except Exception:
+        node_for_adapter["skills_index"] = ""
 
     stop = threading.Event()
     hb = threading.Thread(target=_heartbeat_loop,

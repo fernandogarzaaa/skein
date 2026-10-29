@@ -211,6 +211,58 @@ the verification gate runs `completion` literally, so set one per node
 before running (`skein node edit <id> --completion "pytest tests/x.py"`).
 The draft lists which nodes still need one.
 
+## Skills: procedures agents keep as scripts
+
+Agents repeat themselves: the third agent to run the test suite, find
+the flaky test, or regenerate a lockfile re-derives the same steps from
+scratch. `skein skills` lets an agent (or a human) save such a
+procedure as an **executable script** that later agents run instead of
+re-reading. Two design choices keep this cheap and honest:
+
+- **Scripts, not prose.** A skill is one file under `.skein/skills/`
+  (Python, shell, or anything with a shebang) with a five-line comment
+  header: `name`, `description`, `usage`, `triggers`, `self-test`. An
+  agent's prompt gets **one line per skill** (name, trust stage,
+  description, usage), never the body, so a library of fifty skills
+  costs a few hundred tokens, not fifty files. `skein skills show`
+  prints a body on demand; `skein skills list` reports the index cost
+  versus the body cost.
+- **Trust is earned, and bound to content.** A skill is `proposed` when
+  registered, `tested` once its self-test has run (exit 0 within the
+  timeout; output kept as evidence), and `promoted` only by an explicit
+  `skein skills promote` after the pass rate meets
+  `skill_promote_threshold` (default 1.0). Every transition is an event
+  in the log carrying the script's sha256. Editing a promoted script
+  makes it `modified` (dropped from the index) until it is re-added,
+  re-tested and re-promoted; a self-test that later fails on trusted
+  content revokes the promotion. This follows ADAM's skill lifecycle:
+  nothing is trusted without evidence, and nothing is silently mutated.
+
+```bash
+skein skills new run-tests --description "Run the suite, print only failures" \
+  --triggers test,pytest          # scaffolds .skein/skills/run-tests.py
+$EDITOR .skein/skills/run-tests.py # implement the body and --self-test
+skein skills add run-tests        # proposed (hash recorded, file committed)
+skein skills test run-tests       # self-test -> tested, evidence under .skein/evidence/
+skein skills promote run-tests    # operator decision -> promoted
+skein skills index                # what agents see: one line per skill
+skein skills run run-tests -- -x  # bounded run in the current directory
+skein skills retire run-tests --reason "replaced by ci-check"
+skein skills install              # lean .claude/skills/skein/SKILL.md for the assistant
+```
+
+Backends receive the index automatically (`skills_in_prompt` in
+`config.json`, cap `skills_index_max_lines`), with promoted skills first
+and skills whose `triggers` match the node's title and goal ahead of the
+rest. Inside an agent worktree, `skein skills` commands resolve the main
+repository's control plane, so a skill proposed mid-run lands in the
+shared registry instead of the node's result commit. `GET /api/skills`
+exposes the same registry on the canvas server.
+
+Skills are code that agents and teammates will execute: review a
+proposal before promoting it, exactly as you would review a node's
+completion command.
+
 ## Multi-machine sync
 
 The event log is append-only, so concurrent appends on two machines
@@ -244,6 +296,7 @@ skein sync
 - `src/skein/redact.py` — secret redaction at event/evidence write boundaries
 - `src/skein/runtime.py` — bounded, killable subprocess execution for backends
 - `src/skein/shipping.py` — ship done nodes' result commits, tag releases
+- `src/skein/skills.py` — agent-authored skill scripts: hash-bound trust lifecycle, one-line index for prompts, bounded runs
 
 ## Backend support matrix
 

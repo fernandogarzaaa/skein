@@ -2,6 +2,32 @@
 
 ## Unreleased
 
+### Added
+- **Skills** (`skein skills`): agents and humans save reusable procedures
+  as executable scripts under `.skein/skills/` and later agents run them
+  instead of re-deriving the steps. Prompts carry one line per skill
+  (name, stage, description, usage), never the script bodies, so the
+  token cost stays flat as the library grows; `skein skills show` prints
+  a body on demand and `skein skills list` reports index-vs-body token
+  estimates. Trust follows an evidence-gated lifecycle borrowed from
+  ADAM's skill engine: `proposed` on `add` -> `tested` after the script's
+  self-test passes (evidence file kept) -> `promoted` only by an explicit
+  `promote` once the pass rate meets `skill_promote_threshold`. Every
+  transition is a `skill` event carrying the script's sha256; editing a
+  promoted script demotes it to `modified` until re-added and re-tested,
+  and a failing self-test on trusted content revokes the promotion.
+  `run` goes through the bounded runtime (capped output, whole-tree kill
+  on timeout) in the caller's directory; from inside an agent worktree,
+  skills commands resolve the main repository's control plane so a skill
+  proposed mid-run never rides into a result commit. Also `retire` /
+  `--reject`, `GET /api/skills`, and `skein skills install`, which
+  writes a lean `.claude/skills/skein/SKILL.md` (or codex/agents/
+  gemini/opencode) in the style of graphify's installer so the assistant
+  knows to consult the index first. New config keys:
+  `skill_promote_threshold`, `skill_test_timeout_seconds`,
+  `skill_run_timeout_seconds`, `skills_in_prompt`,
+  `skills_index_max_lines`.
+
 Fixes from an end-to-end audit in a fresh repository.
 
 ### Fixed

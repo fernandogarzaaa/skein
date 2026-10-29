@@ -71,6 +71,11 @@ VALID_EVENT_TYPES = {
     # no node state is derived; idempotency is checked by scanning the
     # log for the draft hash.
     "plan_applied",
+    # skills (skein skills): lifecycle of agent-authored skill scripts,
+    # anchored at the reserved "skein-skill" id. Informational like
+    # plan_applied: no node state is derived; skills.registry reduces
+    # them (proposed/tested/promoted/retired, bound to the script hash).
+    "skill",
 }
 
 # Statuses a human may set directly via node edit / web UI. Terminal and
@@ -108,7 +113,14 @@ def config_path(repo_root: str | Path) -> Path:
 def default_config() -> Dict[str, Any]:
     return {"default_ttl_seconds": 1800, "heartbeat_interval_seconds": 60,
             "default_max_retries": 3, "default_retry_backoff_seconds": 60,
-            "default_sandbox": False}
+            "default_sandbox": False,
+            # skills: promotion needs a self-test pass rate >= threshold;
+            # the index (one line per skill) goes into backend prompts
+            "skill_promote_threshold": 1.0,
+            "skill_test_timeout_seconds": 120,
+            "skill_run_timeout_seconds": 600,
+            "skills_in_prompt": True,
+            "skills_index_max_lines": 30}
 
 
 def load_config(repo_root: str | Path) -> Dict[str, Any]:

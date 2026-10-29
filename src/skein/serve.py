@@ -486,6 +486,18 @@ class _Handler(BaseHTTPRequestHandler):
                 for p in list_profiles(self._root)]})
         if parsed.path == "/api/health":
             return self._send(200, _health_dict(self._root))
+        if parsed.path == "/api/skills":
+            from . import skills as sk
+            recs = sk.registry(self._root)
+            return self._send(200, {
+                "skills": [
+                    {"name": r["name"], "stage": r["stage"],
+                     "description": r["description"], "usage": r["usage"],
+                     "triggers": r["triggers"], "fitness": r.get("fitness"),
+                     "tests": len(r["tests"]), "runs": r["runs"],
+                     "run_failures": r["run_failures"], "file": r.get("path")}
+                    for r in recs.values()],
+                "index": sk.index_lines(self._root, max_lines=10 ** 6)})
         if parsed.path == "/api/metrics":
             uptime = time.time() - getattr(self.server, "started_at",
                                            time.time())
