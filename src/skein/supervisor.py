@@ -58,6 +58,20 @@ def _heartbeat_loop(repo_root: str | Path, node_id: str, holder: str,
             pass  # heartbeats are best-effort; reaper handles expiry
 
 
+def _stop_heartbeats(stop: threading.Event, hb: threading.Thread) -> None:
+    """Stop the heartbeat loop and wait for an in-flight heartbeat.
+
+    A heartbeat that is already past stop.wait() when the terminal
+    event lands would find the claim gone, raise ClaimError, and record
+    a spurious `rejected` event (commit=False) after the completion
+    commit, leaving the control plane dirty. Joining first makes the
+    final transition the last write of the run.
+    """
+    stop.set()
+    if hb.is_alive() and hb is not threading.current_thread():
+        hb.join(timeout=30)
+
+
 def _collect_parent_handoffs(nodes: Dict[str, Dict], node: Dict) -> str:
     notes = []
     for dep in node.get("depends_on", []):
@@ -337,7 +351,7 @@ def run_node(repo_root: str | Path, node_id: str, holder: str,
         adapter_output += "\n[skein] aborted by human interrupt; process tree killed"
 
     if aborted:
-        stop.set()
+        _stop_heartbeats(stop, hb)
         # Do NOT release: the human_interrupt event already moved the node
         # to needs_human and cleared the claim atomically. Releasing here
         # would park it back in unclaimed and let the scheduler re-run
@@ -346,7 +360,7 @@ def run_node(repo_root: str | Path, node_id: str, holder: str,
                 "node": g.load_graph(repo_root).get(node_id)}
 
     if timed_out:
-        stop.set()
+        _stop_heartbeats(stop, hb)
         adapter_ev, adapter_redacted = _write_adapter_evidence(
             repo_root, adapter, node_id, adapter_exit, adapter_output)
         _audit_redaction(adapter_redacted, "adapter_evidence")
@@ -366,14 +380,14 @@ def run_node(repo_root: str | Path, node_id: str, holder: str,
     # landed while the agent was finishing, or a lost lease, must stop us
     # here - verification must not run on a node we no longer own.
     if _interrupted(repo_root, node_id, started_ts):
-        stop.set()
+        _stop_heartbeats(stop, hb)
         # The adapter process already exited inside execute(); the
         # human_interrupt event parked the node in needs_human and
         # cleared the claim. Do not release it back to unclaimed.
         return {"outcome": "interrupted", "adapter_exit": adapter_exit,
                 "node": g.load_graph(repo_root).get(node_id)}
     if not owns_attempt():
-        stop.set()
+        _stop_heartbeats(stop, hb)
         return {"outcome": "superseded", "adapter_exit": adapter_exit,
                 "note": "attempt lost ownership before verification; not completing",
                 "node": g.load_graph(repo_root).get(node_id)}
@@ -393,7 +407,7 @@ def run_node(repo_root: str | Path, node_id: str, holder: str,
     _audit_redaction(verify_redacted, "verification_evidence")
     _audit_redaction(adapter_redacted, "adapter_evidence")
     evidence = evidence + [adapter_ev]
-    stop.set()
+    _stop_heartbeats(stop, hb)
 
     # Final fenced transition: re-check interrupt + ownership immediately
     # before appending the terminal event.

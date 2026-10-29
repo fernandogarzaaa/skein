@@ -800,7 +800,12 @@ def _log_fingerprint(repo_root: str | Path) -> Tuple[int, Optional[str], str]:
 
 def _write_atomic(path: Path, text: str) -> None:
     tmp = path.with_name(path.name + ".tmp")
-    tmp.write_text(text, encoding="utf-8")
+    # Bytes, not text mode: on Windows write_text() translates "\n" to
+    # "\r\n", so the file never hashed to the graph_digest recorded in
+    # meta (computed from the in-memory text), _snapshot_is_fresh() was
+    # always False there, and every load_graph() rebuilt and rewrote the
+    # snapshot (leaving graph.meta.json dirty after each read).
+    tmp.write_bytes(text.encode("utf-8"))
     # Windows: a concurrent reader (or an AV scan) can hold the destination
     # open without delete sharing, so the rename can fail with
     # PermissionError even though nothing is logically wrong. The window

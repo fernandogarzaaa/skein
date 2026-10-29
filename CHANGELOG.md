@@ -59,6 +59,14 @@ Fixes from an end-to-end audit in a fresh repository.
   histories); git's own reason is now passed through.
 - `skein sync` no longer raises `KeyError` on hand-written log lines
   without an `event_id`.
+- Windows: the derived `graph.json` snapshot was written in text mode, so
+  CRLF translation made its on-disk bytes never match the digest recorded
+  in `graph.meta.json`; every read rebuilt the graph from the log and
+  rewrote `graph.meta.json` (always dirty, O(log) per command). The
+  snapshot is now written as bytes on every platform.
+- The supervisor now waits for an in-flight heartbeat before the final
+  completed/failed transition; a heartbeat racing the completion used to
+  land a spurious `rejected` event after the commit.
 
 ## 0.3.1 - 2026-10-13
 
