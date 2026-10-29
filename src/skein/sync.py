@@ -65,7 +65,7 @@ def _union_merge_log(repo_root: Any) -> bool:
                 continue
             ev = g.parse_event(line)
             if ev is not None:
-                by_id.setdefault(ev["event_id"], line)
+                by_id.setdefault(ev.get("event_id") or line, line)
     for stage in ("1", "2", "3"):
         r = _git(repo_root, "show", f":{stage}:{log_ref}")
         if r.returncode != 0:
@@ -77,7 +77,8 @@ def _union_merge_log(repo_root: Any) -> bool:
             ev = g.parse_event(line)
             if ev is None:
                 continue  # malformed lines are dropped on rebuild anyway
-            by_id.setdefault(ev["event_id"], line)
+            # hand-written events may lack an id: key on the line itself
+            by_id.setdefault(ev.get("event_id") or line, line)
     # Deterministic order: sort by (timestamp, seq, event_id) so every
     # machine converges on the same file content.
     ordered = sorted(
@@ -88,7 +89,7 @@ def _union_merge_log(repo_root: Any) -> bool:
         "".join(g.serialize_event(e) + "\n" for e in ordered),
         encoding="utf-8")
     g.rebuild_graph(repo_root)  # regenerates graph.json + meta from the log
-    _git(repo_root, "add", g.SKEIN_DIR)
+    _git(repo_root, "add", "--", *g.SKEIN_PATHSPEC)
     r = _git(repo_root, "-c", "user.name=skein", "-c", "user.email=skein@localhost",
              "commit", "-m", "skein: sync auto-merge (log union)")
     return r.returncode == 0
@@ -102,10 +103,11 @@ def sync_repo(repo_root: Any, push: bool = True,
     branch = _current_branch(repo_root)
     if _git(repo_root, "remote", "get-url", remote).returncode != 0:
         raise ValueError(f"no git remote '{remote}' (nothing to sync with)")
-    # checkpoint any uncommitted .skein state first
-    _git(repo_root, "add", g.SKEIN_DIR)
+    # checkpoint any uncommitted .skein state first (control plane only:
+    # worktrees and evidence never ride along)
+    _git(repo_root, "add", "--", *g.SKEIN_PATHSPEC)
     _git(repo_root, "-c", "user.name=skein", "-c", "user.email=skein@localhost",
-          "commit", "-m", "skein: sync checkpoint")
+          "commit", "-m", "skein: sync checkpoint", "--", *g.SKEIN_PATHSPEC)
     fetched = _git(repo_root, "fetch", remote)
     if fetched.returncode != 0:
         raise ValueError(f"fetch from '{remote}' failed: {fetched.stderr.strip()}")
@@ -131,9 +133,9 @@ def sync_repo(repo_root: Any, push: bool = True,
         detail = "fast-forward or clean merge" if "Already up to date" not in (
             merged.stdout or "") else "already up to date"
     g.rebuild_graph(repo_root)
-    _git(repo_root, "add", g.SKEIN_DIR)
+    _git(repo_root, "add", "--", *g.SKEIN_PATHSPEC)
     _git(repo_root, "-c", "user.name=skein", "-c", "user.email=skein@localhost",
-          "commit", "-m", "skein: sync merge")
+          "commit", "-m", "skein: sync merge", "--", *g.SKEIN_PATHSPEC)
     pushed = False
     if push:
         r = _git(repo_root, "push", remote, branch)

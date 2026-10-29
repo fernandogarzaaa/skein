@@ -48,6 +48,37 @@ def find_repo_root(start: str | Path | None = None) -> str:
     return str(git_top) if git_top is not None else str(cur)
 
 
+def control_root(start: str | Path | None = None) -> str:
+    """The repo whose .skein/ is the control plane, even from inside an
+    agent worktree.
+
+    An agent runs skills inside its worktree under .skein/worktrees/<id>,
+    where `.git` is a file and the checked-out .skein/ is a snapshot.
+    Skill lifecycle events written there would ride into the node's
+    result commit instead of the shared log, so skills commands resolve
+    the main working tree (`git rev-parse --git-common-dir`) and use its
+    .skein/. Falls back to find_repo_root() when there is no linked
+    worktree in play.
+    """
+    root = Path(find_repo_root(start))
+    if not (root / ".git").is_file():
+        return str(root)
+    try:
+        r = subprocess.run(["git", "rev-parse", "--git-common-dir"],
+                           capture_output=True, text=True, cwd=str(root))
+    except FileNotFoundError:
+        return str(root)
+    if r.returncode != 0 or not r.stdout.strip():
+        return str(root)
+    common = Path(r.stdout.strip())
+    if not common.is_absolute():
+        common = root / common
+    main_root = common.resolve().parent
+    if (main_root / ".skein").is_dir():
+        return str(main_root)
+    return str(root)
+
+
 def default_actor() -> str:
     return os.environ.get("SKEIN_ACTOR") or getpass.getuser()
 
@@ -117,6 +148,13 @@ def cmd_init(args) -> int:
     if not g.log_path(root).exists():
         g.log_path(root).write_text("", encoding="utf-8")
     g.rebuild_graph(root)
+    # Worktrees are nested git checkouts and evidence logs are per-run
+    # scratch: neither belongs in the repo. Without these rules `git add
+    # .skein` records each worktree as a gitlink and commits every
+    # evidence file on every event (observed in a fresh repo).
+    added = _ensure_gitignore(root)
+    if added:
+        print("added to .gitignore: " + ", ".join(added))
     # install a reminder hook (commits of .skein stay explicit via CLI)
     hooks = Path(root) / ".git" / "hooks"
     if hooks.exists():
@@ -124,9 +162,39 @@ def cmd_init(args) -> int:
         if not hook.exists():
             hook.write_text("#!/bin/sh\n# skein: event log lives under .skein/ and is committed by the CLI on every append.\n",
                             encoding="utf-8")
-    g.git_commit_log(root, "skein: init")
+            # A hook without the exec bit makes git print "hook was
+            # ignored because it's not set as executable" on every commit.
+            try:
+                os.chmod(hook, 0o755)
+            except OSError:
+                pass
+    g.git_commit_log(root, "skein: init",
+                     extra_paths=[".gitignore"] if added else None)
     print(f"initialized skein in {root}/.skein")
     return 0
+
+
+def _gitignore_rules() -> List[str]:
+    return [f"{g.SKEIN_DIR}/{d}/" for d in g.LOCAL_SUBDIRS]
+
+
+def _ensure_gitignore(root: str | Path) -> List[str]:
+    """Append the skein local-scratch rules to the repo .gitignore if they
+    are not already covered. Returns the rules added (possibly empty).
+    Existing user content is preserved; nothing is rewritten."""
+    gi = Path(root) / ".gitignore"
+    existing = gi.read_text(encoding="utf-8") if gi.exists() else ""
+    present = {line.strip().rstrip("/") for line in existing.splitlines()}
+    missing = [r for r in _gitignore_rules() if r.rstrip("/") not in present]
+    if not missing:
+        return []
+    text = existing
+    if text and not text.endswith("\n"):
+        text += "\n"
+    text += "# skein: agent worktrees and evidence logs are local scratch\n"
+    text += "".join(r + "\n" for r in missing)
+    gi.write_text(text, encoding="utf-8")
+    return missing
 
 
 def _split_multi(values) -> list:
@@ -369,7 +437,7 @@ def cmd_claim(args) -> int:
         c.reap_expired(root)
         node = c.claim_node(root, args.id, holder,
                             ttl_seconds=args.ttl, actor=default_actor())
-    except c.ClaimError as e:
+    except (c.ClaimError, ValueError) as e:
         print(f"cannot claim '{args.id}': {e}", file=sys.stderr)
         return 1
     print(f"claimed {args.id} for {holder} (ttl={node['claim']['ttl_seconds']}s)")
@@ -389,7 +457,7 @@ def _run_one_node(root: str, node_id: str, holder: str, actor: str,
                           extra_args=args.adapter_args or [],
                           actor=actor,
                           sandbox=_effective_sandbox(root, args))
-    except (c.ClaimError, ValueError, RuntimeError) as e:
+    except (c.ClaimError, wt.WorktreeError, ValueError, RuntimeError) as e:
         return f"skipped: {e}"
     return result.get("outcome", "unknown")
 
@@ -417,13 +485,22 @@ def _integration_pending(nodes: dict, node: dict) -> bool:
     return all((nodes.get(d) or {}).get("status") == "done" for d in deps)
 
 
-def _schedulable_batch(root: str, limit: int) -> list:
-    """Node ids that can be claimed right now, sorted for determinism."""
+def _schedulable_batch(root: str, limit: int,
+                       exclude: Optional[set] = None) -> list:
+    """Node ids that can be claimed right now, sorted for determinism.
+
+    `exclude` holds nodes this scheduler run already failed to start
+    (claim or worktree setup raised before any attempt ran). Such a node
+    stays unclaimed and eligibility-positive, so without the exclusion
+    the loop would pick it again forever.
+    """
     nodes = g.load_graph(root)
     batch = []
     for nid in sorted(nodes):
         n = nodes[nid]
         if n.get("removed") or n["status"] != "unclaimed":
+            continue
+        if exclude and nid in exclude:
             continue
         ok, _ = c.eligibility(root, nid)
         if not ok and _integration_pending(nodes, n):
@@ -480,11 +557,12 @@ def cmd_run_all(args) -> int:
     max_nodes = args.max_nodes
     c.reap_expired(root)
     results: list = []  # (node_id, outcome, attempts)
+    skipped: set = set()  # nodes that could not even start this run
     ran = 0
     while True:
         if max_nodes is not None and ran >= max_nodes:
             break
-        batch = _schedulable_batch(root, max_parallel)
+        batch = _schedulable_batch(root, max_parallel, exclude=skipped)
         if not batch:
             wait = _next_retry_wait(root)
             if wait is None:
@@ -498,6 +576,8 @@ def cmd_run_all(args) -> int:
             print(f"run {nid} ...")
             outcome = _run_one_node(root, nid, holder, actor, args)
             ran += 1
+            if outcome.startswith("skipped:"):
+                skipped.add(nid)
             node = g.load_graph(root).get(nid) or {}
             attempts = len(node.get("attempts") or [])
             results.append((nid, outcome, attempts))
@@ -512,9 +592,13 @@ def cmd_run_all(args) -> int:
           f"{interrupted} interrupted")
     pending = []
     nodes = g.load_graph(root)
+    skip_reason = {nid: o for nid, o, _ in results if o.startswith("skipped:")}
     for nid in sorted(nodes):
         n = nodes[nid]
         if n.get("removed") or n["status"] != "unclaimed":
+            continue
+        if nid in skip_reason:
+            pending.append((nid, skip_reason[nid]))
             continue
         ok, reason = c.eligibility(root, nid)
         if not ok:
@@ -566,7 +650,7 @@ def cmd_run(args) -> int:
                           extra_args=adapter_args,
                           actor=default_actor(),
                           sandbox=_effective_sandbox(root, args))
-    except (c.ClaimError, ValueError, RuntimeError) as e:
+    except (c.ClaimError, wt.WorktreeError, ValueError, RuntimeError) as e:
         print(f"run failed: {e}", file=sys.stderr)
         return 1
     outcome = result.get("outcome")
@@ -607,7 +691,7 @@ def _cmd_claim_release(args, root: str) -> int:
         c.release_node(root, args.target, actor=actor,
                        force=args.force, note="force-released by human" if args.force else "",
                        claim_token=token)
-    except c.ClaimError as e:
+    except (c.ClaimError, ValueError) as e:
         print(f"cannot release '{args.target}': {e}", file=sys.stderr)
         return 1
     print(f"released {args.target}" + (" (forced)" if args.force else ""))
@@ -650,7 +734,7 @@ def _status_lines(root: str) -> List[str]:
         lease = "-"
         if n["status"] in ("claimed", "in_progress") and claim.get("holder"):
             last = c.parse_ts(claim.get("last_heartbeat") or claim.get("claimed_at"))
-            ttl = claim.get("ttl_seconds") or 0
+            ttl = c.coerce_ttl(claim.get("ttl_seconds"), 0)
             if last:
                 remain = ttl - (now - last).total_seconds()
                 lease = "EXPIRED" if remain <= 0 else f"{int(remain)}s left"
@@ -783,21 +867,34 @@ def cmd_doctor(args) -> int:
     except OSError as e:
         check("no expired leases", False, f"cannot load graph: {e}")
 
-    # 6. config valid
+    # 6. local scratch dirs are not tracked by git (worktrees would be
+    # gitlinks, evidence would be committed on every event)
+    tracked = []
+    for d in g.LOCAL_SUBDIRS:
+        r = subprocess.run(["git", "ls-files", "--", f"{g.SKEIN_DIR}/{d}"],
+                           cwd=root, capture_output=True, text=True)
+        if r.returncode == 0 and r.stdout.strip():
+            tracked.append(f"{g.SKEIN_DIR}/{d}")
+    check("worktrees/evidence untracked", not tracked,
+          "run `git rm -r --cached " + " ".join(tracked) +
+          "` then commit; `skein init` adds the .gitignore rules")
+
+    # 7. config valid
     try:
         cfg = g.load_config(root)
-        known = {"default_ttl_seconds", "heartbeat_interval_seconds",
-                 "default_max_retries", "default_retry_backoff_seconds",
-                 "default_sandbox"}
+        known = set(g.default_config())
         problems = [f"unknown key '{k}'" for k in cfg if k not in known]
         for key in ("default_ttl_seconds", "heartbeat_interval_seconds",
-                    "default_max_retries", "default_retry_backoff_seconds"):
+                    "default_max_retries", "default_retry_backoff_seconds",
+                    "skill_promote_threshold", "skill_test_timeout_seconds",
+                    "skill_run_timeout_seconds", "skills_index_max_lines"):
             v = cfg.get(key)
             if v is not None and not (isinstance(v, (int, float))
                                       and not isinstance(v, bool) and v >= 0):
                 problems.append(f"'{key}' must be a non-negative number")
-        if "default_sandbox" in cfg and not isinstance(cfg["default_sandbox"], bool):
-            problems.append("'default_sandbox' must be true/false")
+        for key in ("default_sandbox", "skills_in_prompt"):
+            if key in cfg and not isinstance(cfg[key], bool):
+                problems.append(f"'{key}' must be true/false")
         check("config valid", not problems, "; ".join(problems))
     except (OSError, ValueError) as e:
         check("config valid", False, f"cannot parse config.json: {e}")
@@ -1062,6 +1159,129 @@ def cmd_ship(args) -> int:
     return 0
 
 
+_RUN_OPTS = argparse.ArgumentParser(add_help=False)
+_RUN_OPTS.add_argument("--timeout", type=float, default=None)
+_RUN_OPTS.add_argument("--no-record", action="store_true")
+_RUN_OPTS.add_argument("--promoted-only", action="store_true")
+
+
+def _split_run_args(rest: list) -> tuple:
+    """Split `skein skills run <name> ...` tokens into (our options, skill
+    args). argparse's REMAINDER hands us everything after the name, so
+    skein's own flags are parsed here: tokens before a `--` that are
+    skein options are consumed, everything else (and everything after
+    `--`) goes to the skill untouched."""
+    rest = list(rest or [])
+    if "--" in rest:
+        idx = rest.index("--")
+        ours_raw, theirs = rest[:idx], rest[idx + 1:]
+    else:
+        ours_raw, theirs = rest, []
+    ours, passthrough = _RUN_OPTS.parse_known_args(ours_raw)
+    return ours, passthrough + theirs
+
+
+def cmd_skills(args) -> int:
+    from . import skills as sk
+    root = control_root()
+    actor = default_actor()
+    sub = args.skills_cmd
+    try:
+        if sub == "list":
+            print(sk.render_table(root))
+            return 0
+        if sub == "index":
+            node = None
+            if getattr(args, "for_node", None):
+                node = g.load_graph(root).get(args.for_node)
+                if node is None:
+                    print(f"unknown node '{args.for_node}'", file=sys.stderr)
+                    return 1
+            lines = sk.index_lines(root, node,
+                                   include_untrusted=not args.promoted_only)
+            print("\n".join(lines) if lines else "(no skills)")
+            return 0
+        if sub == "new":
+            path = sk.scaffold(root, args.name, description=args.description or "",
+                               lang=args.lang, triggers=_split_multi(args.triggers),
+                               overwrite=args.overwrite)
+            print(f"scaffolded {path}")
+            print(f"next: edit it (implement the body and --self-test), then\n"
+                  f"  skein skills add {args.name}\n  skein skills test {args.name}")
+            return 0
+        if sub == "add":
+            rec = sk.add(root, actor, args.name, source=args.file,
+                         overwrite=args.overwrite)
+            print(f"registered skill '{args.name}' as {rec['stage']} "
+                  f"({Path(rec['path']).name}); next: skein skills test {args.name}")
+            return 0
+        if sub == "test":
+            names = [args.name] if args.name else [
+                n for n, r in sk.registry(root).items()
+                if r["stage"] in ("proposed", "tested", "promoted")]
+            if not names:
+                print("no registered skills to test")
+                return 0
+            failed = 0
+            for name in names:
+                try:
+                    rec = sk.test(root, name, actor=actor, timeout=args.timeout)
+                except sk.SkillError as e:
+                    print(f"{name}: {e}", file=sys.stderr)
+                    failed += 1
+                    continue
+                lt = rec["last_test"]
+                verdict = "passed" if lt["passed"] else (
+                    "TIMEOUT" if lt["timed_out"] else f"FAILED (exit {lt['exit_code']})")
+                print(f"{name}: self-test {verdict} in {lt['duration_ms']} ms -> "
+                      f"stage {rec['stage']} (evidence {lt['output_ref']})")
+                if not lt["passed"]:
+                    failed += 1
+            return 1 if failed else 0
+        if sub == "promote":
+            rec = sk.promote(root, args.name, actor=actor)
+            print(f"promoted skill '{args.name}' (pass rate "
+                  f"{rec['fitness']:.2f} over {len(rec['tests'])} test(s))")
+            return 0
+        if sub == "retire":
+            rec = sk.retire(root, args.name, actor=actor, reason=args.reason or "",
+                            reject=args.reject)
+            print(f"skill '{args.name}' is now {rec['stage']}")
+            return 0
+        if sub == "run":
+            opts, skill_args = _split_run_args(args.args)
+            r = sk.run(root, args.name, skill_args, cwd=os.getcwd(),
+                       timeout=opts.timeout, record=not opts.no_record,
+                       actor=actor, allow_untrusted=not opts.promoted_only)
+            sys.stdout.write(r.stdout)
+            if r.stderr:
+                sys.stderr.write(r.stderr)
+            if r.timed_out:
+                print(f"[skein] skill '{args.name}' timed out; process tree killed",
+                      file=sys.stderr)
+            return r.exit_code if r.exit_code >= 0 else 1
+        if sub == "show":
+            rec = sk.get(root, args.name)
+            if not rec.get("path"):
+                print(f"skill '{args.name}' has no file", file=sys.stderr)
+                return 1
+            print(Path(rec["path"]).read_text(encoding="utf-8", errors="replace"), end="")
+            return 0
+        if sub == "install":
+            dest = sk.install(root, platform=args.platform)
+            print(f"wrote {dest}")
+            print(f"git add {dest.relative_to(root)}  # share it with the team")
+            return 0
+    except sk.SkillError as e:
+        print(f"skills: {e}", file=sys.stderr)
+        return 1
+    except ValueError as e:
+        print(f"skills: {e}", file=sys.stderr)
+        return 1
+    print(f"unknown skills command {sub!r}", file=sys.stderr)
+    return 1
+
+
 # ---------- parser ----------
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1278,6 +1498,61 @@ def build_parser() -> argparse.ArgumentParser:
     br.add_argument("name")
     br.add_argument("--scope", default="", choices=["", "repo", "user"])
     br.set_defaults(func=cmd_backends_remove)
+
+    psk = sub.add_parser("skills",
+                         help="agent-authored skill scripts: index, run, test, promote")
+    ssub = psk.add_subparsers(dest="skills_cmd", required=True)
+    s = ssub.add_parser("list", help="every skill with stage, evidence and run counts")
+    s.set_defaults(func=cmd_skills)
+    s = ssub.add_parser("index", help="one line per skill (what agents see in their prompt)")
+    s.add_argument("--for", dest="for_node", default=None, metavar="NODE",
+                   help="rank skills whose triggers match this node first")
+    s.add_argument("--promoted-only", action="store_true")
+    s.set_defaults(func=cmd_skills)
+    s = ssub.add_parser("new", help="scaffold a skill script from the template")
+    s.add_argument("name")
+    s.add_argument("--description", default="")
+    s.add_argument("--lang", default="py", choices=["py", "sh"])
+    s.add_argument("--triggers", action="append", default=None,
+                   help="keywords that make this skill relevant (repeatable/comma-separated)")
+    s.add_argument("--overwrite", action="store_true")
+    s.set_defaults(func=cmd_skills)
+    s = ssub.add_parser("add", help="register (propose) a skill from its script file")
+    s.add_argument("name")
+    s.add_argument("--file", default=None,
+                   help="copy this script into .skein/skills/ (default: the file already there)")
+    s.add_argument("--overwrite", action="store_true")
+    s.set_defaults(func=cmd_skills)
+    s = ssub.add_parser("test", help="run a skill's self-test and record the evidence")
+    s.add_argument("name", nargs="?", default=None, help="omit to test every registered skill")
+    s.add_argument("--timeout", type=float, default=None)
+    s.set_defaults(func=cmd_skills)
+    s = ssub.add_parser("promote", help="trust a tested skill (operator decision)")
+    s.add_argument("name")
+    s.set_defaults(func=cmd_skills)
+    s = ssub.add_parser("retire", help="retire (or --reject) a skill; kept in the log")
+    s.add_argument("name")
+    s.add_argument("--reason", default="")
+    s.add_argument("--reject", action="store_true",
+                   help="mark as rejected (failed its purpose) rather than retired")
+    s.set_defaults(func=cmd_skills)
+    s = ssub.add_parser(
+        "run", help="run a skill in the current directory (bounded, capped output)",
+        epilog="options: --timeout S, --no-record (no run event), --promoted-only "
+               "(refuse untrusted skills); put them before `--`, the skill gets "
+               "everything after it")
+    s.add_argument("name")
+    s.add_argument("args", nargs=argparse.REMAINDER,
+                   help="skein run options, then `--`, then the skill's arguments")
+    s.set_defaults(func=cmd_skills)
+    s = ssub.add_parser("show", help="print a skill's script (the reference, loaded on demand)")
+    s.add_argument("name")
+    s.set_defaults(func=cmd_skills)
+    s = ssub.add_parser("install",
+                        help="write a lean SKILL.md so the assistant knows to use skein skills")
+    s.add_argument("--platform", default="claude",
+                   choices=["claude", "codex", "agents", "gemini", "opencode"])
+    s.set_defaults(func=cmd_skills)
 
     pw = sub.add_parser("worktree", help="worktree maintenance")
     wsub = pw.add_subparsers(dest="worktree_cmd", required=True)

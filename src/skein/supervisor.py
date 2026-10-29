@@ -58,6 +58,20 @@ def _heartbeat_loop(repo_root: str | Path, node_id: str, holder: str,
             pass  # heartbeats are best-effort; reaper handles expiry
 
 
+def _stop_heartbeats(stop: threading.Event, hb: threading.Thread) -> None:
+    """Stop the heartbeat loop and wait for an in-flight heartbeat.
+
+    A heartbeat that is already past stop.wait() when the terminal
+    event lands would find the claim gone, raise ClaimError, and record
+    a spurious `rejected` event (commit=False) after the completion
+    commit, leaving the control plane dirty. Joining first makes the
+    final transition the last write of the run.
+    """
+    stop.set()
+    if hb.is_alive() and hb is not threading.current_thread():
+        hb.join(timeout=30)
+
+
 def _collect_parent_handoffs(nodes: Dict[str, Dict], node: Dict) -> str:
     notes = []
     for dep in node.get("depends_on", []):
@@ -233,8 +247,15 @@ def run_node(repo_root: str | Path, node_id: str, holder: str,
     nodes = g.load_graph(repo_root)
     node = nodes[node_id]
     claim_holder = (node.get("claim") or {}).get("holder")
+    claimed_here = False
     if node["status"] == "unclaimed":
         node = c.claim_node(repo_root, node_id, holder, actor=actor)
+        claimed_here = True
+    elif node["status"] not in ("claimed", "in_progress"):
+        raise c.ClaimError(
+            f"node '{node_id}' is '{node['status']}', not runnable; "
+            f"reset it to unclaimed first (`skein node edit {node_id} "
+            f"--status unclaimed` or `skein release {node_id} --force`)")
     elif claim_holder != holder:
         raise c.ClaimError(f"node '{node_id}' held by '{claim_holder}', not '{holder}'")
 
@@ -249,7 +270,20 @@ def run_node(repo_root: str | Path, node_id: str, holder: str,
                 and cur.get("claim_token") == claim_token
                 and cur.get("holder") == holder)
 
-    path, branch, base = wt.ensure_worktree(repo_root, node_id, actor=actor)
+    try:
+        path, branch, base = wt.ensure_worktree(repo_root, node_id, actor=actor)
+    except wt.WorktreeError as e:
+        # No attempt ran. A claim we just took would otherwise sit on the
+        # node until the lease expires; hand it back with the reason so
+        # the node is immediately re-runnable once the base is fixed.
+        if claimed_here and claim_token:
+            try:
+                c.release_node(repo_root, node_id, actor,
+                               note=f"worktree setup failed: {e}",
+                               claim_token=claim_token)
+            except (c.ClaimError, ValueError):
+                pass
+        raise
     # Durable base of this attempt, captured before the agent runs.
     base_commit = _git_in(path, "rev-parse", "HEAD").stdout.strip()
 
@@ -261,6 +295,13 @@ def run_node(repo_root: str | Path, node_id: str, holder: str,
     node_for_adapter["intent"] = dict(node.get("intent", {}))
     if handoffs:
         node_for_adapter["intent"]["parent_handoffs"] = handoffs
+    # Skill index: one line per skill from the registry, never the script
+    # bodies, so the prompt cost stays flat as the library grows.
+    try:
+        from . import skills as sk
+        node_for_adapter["skills_index"] = sk.prompt_block(repo_root, node)
+    except Exception:
+        node_for_adapter["skills_index"] = ""
 
     stop = threading.Event()
     hb = threading.Thread(target=_heartbeat_loop,
@@ -317,7 +358,7 @@ def run_node(repo_root: str | Path, node_id: str, holder: str,
         adapter_output += "\n[skein] aborted by human interrupt; process tree killed"
 
     if aborted:
-        stop.set()
+        _stop_heartbeats(stop, hb)
         # Do NOT release: the human_interrupt event already moved the node
         # to needs_human and cleared the claim atomically. Releasing here
         # would park it back in unclaimed and let the scheduler re-run
@@ -326,7 +367,7 @@ def run_node(repo_root: str | Path, node_id: str, holder: str,
                 "node": g.load_graph(repo_root).get(node_id)}
 
     if timed_out:
-        stop.set()
+        _stop_heartbeats(stop, hb)
         adapter_ev, adapter_redacted = _write_adapter_evidence(
             repo_root, adapter, node_id, adapter_exit, adapter_output)
         _audit_redaction(adapter_redacted, "adapter_evidence")
@@ -346,14 +387,14 @@ def run_node(repo_root: str | Path, node_id: str, holder: str,
     # landed while the agent was finishing, or a lost lease, must stop us
     # here - verification must not run on a node we no longer own.
     if _interrupted(repo_root, node_id, started_ts):
-        stop.set()
+        _stop_heartbeats(stop, hb)
         # The adapter process already exited inside execute(); the
         # human_interrupt event parked the node in needs_human and
         # cleared the claim. Do not release it back to unclaimed.
         return {"outcome": "interrupted", "adapter_exit": adapter_exit,
                 "node": g.load_graph(repo_root).get(node_id)}
     if not owns_attempt():
-        stop.set()
+        _stop_heartbeats(stop, hb)
         return {"outcome": "superseded", "adapter_exit": adapter_exit,
                 "note": "attempt lost ownership before verification; not completing",
                 "node": g.load_graph(repo_root).get(node_id)}
@@ -373,7 +414,7 @@ def run_node(repo_root: str | Path, node_id: str, holder: str,
     _audit_redaction(verify_redacted, "verification_evidence")
     _audit_redaction(adapter_redacted, "adapter_evidence")
     evidence = evidence + [adapter_ev]
-    stop.set()
+    _stop_heartbeats(stop, hb)
 
     # Final fenced transition: re-check interrupt + ownership immediately
     # before appending the terminal event.
@@ -391,9 +432,18 @@ def run_node(repo_root: str | Path, node_id: str, holder: str,
         try:
             result, warnings = _checkpoint_result(
                 repo_root, path, node_id, attempt_id, base_commit, node, actor)
-        except PolicyViolation as e:
-            c.fail_node(repo_root, node_id, holder, claim_token,
-                        evidence=evidence, error=str(e))
+        except (PolicyViolation, RuntimeError) as e:
+            # PolicyViolation: out-of-scope changes under 'strict'.
+            # RuntimeError: git add/commit failed in the worktree. Either
+            # way the attempt produced no durable result commit, so it is
+            # recorded as failed (retry policy applies) instead of leaving
+            # the node claimed until the lease expires.
+            try:
+                c.fail_node(repo_root, node_id, holder, claim_token,
+                            evidence=evidence, error=str(e))
+            except c.ClaimError:
+                return {"outcome": "superseded", "adapter_exit": adapter_exit,
+                        "node": g.load_graph(repo_root).get(node_id)}
             return {"outcome": "failed", "adapter_exit": adapter_exit,
                     "evidence": evidence,
                     "node": g.load_graph(repo_root).get(node_id)}

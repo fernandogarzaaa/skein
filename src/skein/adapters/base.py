@@ -11,12 +11,15 @@ class BackendAdapter:
 
     def build_prompt(self, node: Dict) -> str:
         intent = node.get("intent", {})
-        return (
+        prompt = (
             f"Goal: {intent.get('goal', '')}\n"
             f"Context: {intent.get('context', '')}\n"
             f"Constraints: {intent.get('constraints', '')}\n"
             f"Completion check: {intent.get('completion', '')}\n"
         )
+        if node.get("skills_index"):
+            prompt += "\n" + node["skills_index"]
+        return prompt
 
     def run(self, node: Dict, worktree_path: str | Path, timeout: int = 600
             ) -> Tuple[int, str]:

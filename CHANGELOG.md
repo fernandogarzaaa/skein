@@ -2,6 +2,98 @@
 
 ## Unreleased
 
+### Added
+- **Skills** (`skein skills`): agents and humans save reusable procedures
+  as executable scripts under `.skein/skills/` and later agents run them
+  instead of re-deriving the steps. Prompts carry one line per skill
+  (name, stage, description, usage), never the script bodies, so the
+  token cost stays flat as the library grows; `skein skills show` prints
+  a body on demand and `skein skills list` reports index-vs-body token
+  estimates. Trust follows an evidence-gated lifecycle borrowed from
+  ADAM's skill engine: `proposed` on `add` -> `tested` after the script's
+  self-test passes (evidence file kept) -> `promoted` only by an explicit
+  `promote` once the pass rate meets `skill_promote_threshold`. Every
+  transition is a `skill` event carrying the script's sha256; editing a
+  promoted script demotes it to `modified` until re-added and re-tested,
+  and a failing self-test on trusted content revokes the promotion.
+  `run` goes through the bounded runtime (capped output, whole-tree kill
+  on timeout) in the caller's directory; from inside an agent worktree,
+  skills commands resolve the main repository's control plane so a skill
+  proposed mid-run never rides into a result commit. Also `retire` /
+  `--reject`, `GET /api/skills`, and `skein skills install`, which
+  writes a lean `.claude/skills/skein/SKILL.md` (or codex/agents/
+  gemini/opencode) in the style of graphify's installer so the assistant
+  knows to consult the index first. New config keys:
+  `skill_promote_threshold`, `skill_test_timeout_seconds`,
+  `skill_run_timeout_seconds`, `skills_in_prompt`,
+  `skills_index_max_lines`.
+
+Fixes from an end-to-end audit in a fresh repository.
+
+### Fixed
+- `skein init` did not ignore `.skein/worktrees/` or `.skein/evidence/`,
+  so every event commit recorded each agent worktree as a gitlink and
+  committed every evidence log. `init` now appends both rules to
+  `.gitignore` (preserving existing content), every skein-authored commit
+  excludes them by pathspec even in repos initialized before this fix,
+  and `skein doctor` reports a repo that still tracks them with the
+  `git rm -r --cached` command to run.
+- The post-commit hook written by `init` had no exec bit, so git printed
+  "hook was ignored because it's not set as executable" on every user
+  commit.
+- `skein release <node>` on a failed / blocked / needs_human node without
+  `--force` crashed with an uncaught `ValueError` from the write-time state
+  machine. It is now a clean error explaining `--force` (or `node edit
+  --status unclaimed`); `skein run` on such a node says the same instead
+  of "held by 'None'".
+- A non-numeric, zero, negative or fractional `ttl_seconds` (reachable
+  through `POST /api/nodes/<id>/claim`) was stored on the claim and made
+  every later `skein status`, `claim`, `reap` and `run` raise. The claim
+  now rejects it up front (400 from the API), and readers tolerate a bad
+  TTL already in a synced log instead of crashing.
+- `skein plan` wrote the task description into `completion`, which the
+  gate executes as a shell command, so every planned node failed
+  verification with "command not found". The prose now goes to `context`;
+  `completion` is left empty and the draft warns which nodes need one.
+- The canvas "save" button re-sent the node's current status, which the
+  server refuses for done/failed/claimed nodes (manual statuses only), so
+  editing a finished node's title failed. The form now sends only changed
+  fields and offers only settable statuses; the server also ignores an
+  unchanged status.
+- `/node/<id>` rendered empty evidence rows (it read keys the evidence
+  never had); it now shows command, exit code, output file and nonce/abort
+  notes.
+- `skein run --all` looped forever (appending a `rejected` event each
+  pass) when a node passed eligibility but its claim or worktree setup
+  kept failing, e.g. a dependency's result commit was pruned. Such nodes
+  are run once per scheduler invocation and listed under "not run".
+- `skein run` surfaced worktree errors (`WorktreeError`,
+  `BaseCommitUnavailable`) as tracebacks; they are now reported like other
+  run failures, and a claim taken for that run is released with the
+  reason instead of sitting until the lease expires.
+- A git failure while creating the result commit left the node claimed
+  (heartbeats stopped) until reaped; it now records a failed attempt with
+  the git error, so the retry policy applies.
+- `skein claim` then `skein run` later could build the worktree on a
+  dependency result commit that had since been superseded by a re-run;
+  the pinned base is re-checked and the run refuses with a message.
+- Web API edits now validate payload shapes (`depends_on`/`blast_radius`
+  must be lists, `backend_config` an object, `intent` an object of
+  strings); a bare string was previously iterated character by character.
+- `skein ship` reported "conflicted on: (unknown files)" when git refused
+  the merge for a non-conflict reason (dirty checkout, unrelated
+  histories); git's own reason is now passed through.
+- `skein sync` no longer raises `KeyError` on hand-written log lines
+  without an `event_id`.
+- Windows: the derived `graph.json` snapshot was written in text mode, so
+  CRLF translation made its on-disk bytes never match the digest recorded
+  in `graph.meta.json`; every read rebuilt the graph from the log and
+  rewrote `graph.meta.json` (always dirty, O(log) per command). The
+  snapshot is now written as bytes on every platform.
+- The supervisor now waits for an in-flight heartbeat before the final
+  completed/failed transition; a heartbeat racing the completion used to
+  land a spurious `rejected` event after the commit.
+
 ## 0.3.1 - 2026-10-13
 
 ### Security

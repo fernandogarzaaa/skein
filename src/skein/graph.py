@@ -30,6 +30,17 @@ GRAPH_NAME = "graph.json"
 META_NAME = "graph.meta.json"
 CONFIG_NAME = "config.json"
 
+# Subdirectories of .skein that are local scratch, never control-plane
+# state: agent worktrees (nested git checkouts; `git add .skein` would
+# record them as gitlinks) and evidence logs (regenerated per run).
+# `skein init` gitignores them and every skein commit excludes them by
+# pathspec, so an existing repo without the ignore rules stays clean.
+LOCAL_SUBDIRS = ("worktrees", "evidence")
+
+# Pathspec for "the control plane under .skein": the directory minus the
+# local-only subdirectories above. Used by every skein-authored commit.
+SKEIN_PATHSPEC = [SKEIN_DIR] + [f":(exclude){SKEIN_DIR}/{d}" for d in LOCAL_SUBDIRS]
+
 # Increment when the event schema changes in a way old readers must detect.
 EVENT_SCHEMA_VERSION = 1
 
@@ -60,6 +71,11 @@ VALID_EVENT_TYPES = {
     # no node state is derived; idempotency is checked by scanning the
     # log for the draft hash.
     "plan_applied",
+    # skills (skein skills): lifecycle of agent-authored skill scripts,
+    # anchored at the reserved "skein-skill" id. Informational like
+    # plan_applied: no node state is derived; skills.registry reduces
+    # them (proposed/tested/promoted/retired, bound to the script hash).
+    "skill",
 }
 
 # Statuses a human may set directly via node edit / web UI. Terminal and
@@ -97,7 +113,14 @@ def config_path(repo_root: str | Path) -> Path:
 def default_config() -> Dict[str, Any]:
     return {"default_ttl_seconds": 1800, "heartbeat_interval_seconds": 60,
             "default_max_retries": 3, "default_retry_backoff_seconds": 60,
-            "default_sandbox": False}
+            "default_sandbox": False,
+            # skills: promotion needs a self-test pass rate >= threshold;
+            # the index (one line per skill) goes into backend prompts
+            "skill_promote_threshold": 1.0,
+            "skill_test_timeout_seconds": 120,
+            "skill_run_timeout_seconds": 600,
+            "skills_in_prompt": True,
+            "skills_index_max_lines": 30}
 
 
 def load_config(repo_root: str | Path) -> Dict[str, Any]:
@@ -309,6 +332,12 @@ def _lease_expired_at(claim: Dict[str, Any], at_ts: Optional[str]) -> bool:
     last = claim.get("last_heartbeat") or claim.get("claimed_at")
     ttl = claim.get("ttl_seconds")
     if not last or not ttl or not at_ts:
+        return False
+    try:
+        ttl = float(ttl)
+    except (TypeError, ValueError):
+        return False  # malformed TTL: never treat as expired on reduce
+    if ttl <= 0:
         return False
     try:
         at = datetime.fromisoformat(at_ts)
@@ -783,7 +812,12 @@ def _log_fingerprint(repo_root: str | Path) -> Tuple[int, Optional[str], str]:
 
 def _write_atomic(path: Path, text: str) -> None:
     tmp = path.with_name(path.name + ".tmp")
-    tmp.write_text(text, encoding="utf-8")
+    # Bytes, not text mode: on Windows write_text() translates "\n" to
+    # "\r\n", so the file never hashed to the graph_digest recorded in
+    # meta (computed from the in-memory text), _snapshot_is_fresh() was
+    # always False there, and every load_graph() rebuilt and rewrote the
+    # snapshot (leaving graph.meta.json dirty after each read).
+    tmp.write_bytes(text.encode("utf-8"))
     # Windows: a concurrent reader (or an AV scan) can hold the destination
     # open without delete sharing, so the rename can fail with
     # PermissionError even though nothing is logically wrong. The window
@@ -862,16 +896,21 @@ def get_node(repo_root: str | Path, node_id: str) -> Optional[Dict[str, Any]]:
     return load_graph(repo_root).get(node_id)
 
 
-def git_commit_log(repo_root: str | Path, message: str) -> bool:
-    """Commit .skein log + derived graph. Returns True if committed."""
+def git_commit_log(repo_root: str | Path, message: str,
+                   extra_paths: Optional[List[str]] = None) -> bool:
+    """Commit .skein log + derived graph (plus extra_paths, e.g. the
+    .gitignore that `skein init` writes). Returns True if committed."""
+    pathspec = SKEIN_PATHSPEC + list(extra_paths or [])
     try:
-        subprocess.run(["git", "add", SKEIN_DIR], cwd=str(repo_root),
+        subprocess.run(["git", "add", "--"] + pathspec, cwd=str(repo_root),
                        capture_output=True, check=False)
         # Scope the commit to .skein: a bare `git commit` would sweep in any
         # unrelated user-staged files (observed in a live walkthrough).
+        # Worktrees and evidence are excluded by pathspec even when the
+        # repo has no .gitignore rule for them (see SKEIN_PATHSPEC).
         r = subprocess.run(
             ["git", "-c", "user.name=skein", "-c", "user.email=skein@localhost",
-             "commit", "-m", message, "--", SKEIN_DIR],
+             "commit", "-m", message, "--"] + pathspec,
             cwd=str(repo_root), capture_output=True, check=False)
         return r.returncode == 0
     except FileNotFoundError:

@@ -22,7 +22,7 @@ import random
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path, PurePosixPath
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from . import graph as g
 from . import locks
@@ -172,10 +172,28 @@ def eligibility(repo_root: str | Path, node_id: str) -> Tuple[bool, str]:
     return True, "eligible"
 
 
+def coerce_ttl(value: Any, fallback: Optional[int] = None) -> Optional[int]:
+    """Positive integer TTL, or fallback when the value is not one.
+
+    Claim records come from the log (possibly synced from elsewhere or
+    posted through the web API), so a non-numeric or non-positive TTL
+    must degrade to the fallback instead of crashing every reader.
+    """
+    if isinstance(value, bool):
+        return fallback
+    try:
+        v = int(value)  # type: ignore[arg-type]
+        if float(value) != v:  # type: ignore[arg-type]
+            return fallback
+    except (TypeError, ValueError, OverflowError):
+        return fallback
+    return v if v > 0 else fallback
+
+
 def is_expired(node: Dict, at: Optional[datetime] = None) -> bool:
     claim = node.get("claim") or {}
     last = parse_ts(claim.get("last_heartbeat") or claim.get("claimed_at"))
-    ttl = claim.get("ttl_seconds")
+    ttl = coerce_ttl(claim.get("ttl_seconds"))
     if not last or not ttl:
         return False
     at = at or now_utc()
@@ -225,7 +243,18 @@ def claim_node(repo_root: str | Path, node_id: str, holder: str,
     """
     from . import worktree as wt
     cfg = g.load_config(repo_root)
-    ttl = ttl_seconds if ttl_seconds is not None else int(cfg.get("default_ttl_seconds", 1800))
+    if ttl_seconds is None:
+        ttl = coerce_ttl(cfg.get("default_ttl_seconds"), 1800)
+    else:
+        # Validate before anything reaches the log: a bad TTL stored on a
+        # claim would make every later is_expired() call raise.
+        ttl = coerce_ttl(ttl_seconds)
+        if ttl is None:
+            raise ClaimError(
+                f"invalid ttl_seconds {ttl_seconds!r}: expected a positive "
+                f"integer number of seconds")
+    if not holder or not isinstance(holder, str):
+        raise ClaimError("holder must be a non-empty string")
     actor = actor or holder
     worker_id = worker_id or holder
     # The whole read-check-append runs inside one critical section, so
@@ -310,6 +339,16 @@ def release_node(repo_root: str | Path, node_id: str, actor: str,
                     raise ClaimError(
                         f"node '{node_id}' held by '{holder}'; use --force for explicit force-release"
                     )
+        elif not force:
+            # Parked node (needs_human/failed/blocked): there is no live
+            # attempt to release, so resetting it to unclaimed is an
+            # explicit operator override, not a holder's own release.
+            # Without this check the write-time state machine rejected
+            # the event with an uncaught ValueError.
+            raise ClaimError(
+                f"node '{node_id}' is '{node['status']}' with no live claim; "
+                f"use --force to reset it to unclaimed, or "
+                f"`skein node edit {node_id} --status unclaimed`")
         payload = {"note": note or (f"force-released by {actor}" if force else f"released by {actor}"),
                    "forced": force,
                    "holder": (node.get("claim") or {}).get("holder")}

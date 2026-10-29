@@ -50,6 +50,11 @@ class ProfileAdapter(BackendAdapter):
         )
         if handoffs:
             prompt += f"\nHANDOFF NOTES FROM DEPENDENCIES:\n{handoffs}\n"
+        # One line per skill, never the script bodies (see skills.py):
+        # the supervisor fills this from the registry.
+        skills_block = node.get("skills_index") or ""
+        if skills_block:
+            prompt += "\n" + skills_block
         prompt += ("\nMake the change in the current working directory. "
                    "Do not commit unless asked.")
         return prompt

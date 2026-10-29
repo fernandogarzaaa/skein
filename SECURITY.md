@@ -27,6 +27,13 @@ A few things about Skein's design are worth knowing before reporting:
   git worktrees for parallel agents. It operates on the repositories you
   point it at; do not run it against repositories with uncommitted
   sensitive changes you cannot afford to have read by an agent.
+- **Skills are executable scripts shared through git.** `.skein/skills/`
+  is committed and `skein skills run` executes a script in the caller's
+  directory with the caller's environment. The trust stage shown in the
+  index (`proposed` / `tested` / `promoted`) is evidence that the script's
+  self-test passed on that exact content, not a review of what it does.
+  Review a proposal before promoting it, and treat a `proposed` skill
+  from a synced peer like any other unreviewed code.
 - **The CLI shells out to Python.** Skein invokes the Python interpreter
   to run its own modules. The interpreter resolution honors `APE_PYTHON`
   and falls back from `python` to `python3`; a hostile `PATH` could
