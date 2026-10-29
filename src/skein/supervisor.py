@@ -239,8 +239,23 @@ def run_node(repo_root: str | Path, node_id: str, holder: str,
                                  backend_config=node.get("backend_config"),
                                  extra_args=extra_args)
 
-    # multi-dependency: ensure integration node exists first
-    if len(node.get("depends_on", [])) > 1:
+    deps = node.get("depends_on", [])
+    deps_done = all((nodes.get(d) or {}).get("status") == "done" for d in deps)
+    if node.get("integration_for"):
+        # an integration node IS the merge step: run it as the
+        # deterministic auto-merge, never as an agent with its own
+        # nested __integrate node
+        if node["status"] == "unclaimed" and deps_done:
+            if not wt.auto_merge_parents(repo_root, node_id, actor=actor):
+                note = g.load_graph(repo_root)[node_id].get("handoff_note")
+                raise RuntimeError(note or f"auto-merge of '{node_id}' failed")
+            done = g.load_graph(repo_root)[node_id]
+            return {"outcome": "done", "adapter_exit": None,
+                    "evidence": done.get("evidence"),
+                    "result": done.get("result"), "node": done}
+    elif len(deps) > 1 and deps_done:
+        # created only once every parent is done: an earlier creation
+        # attempts the auto-merge too soon and it is never retried
         wt.ensure_integration_node(repo_root, node_id, actor=actor)
 
     # claim if needed (idempotent when we already hold it)

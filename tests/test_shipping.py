@@ -472,3 +472,30 @@ def test_serve_ship_and_release(server, cli_repo):
     assert code == 409
     code, data = _call("POST", server + "/api/release", {"tag": "bad tag"})
     assert code == 409
+
+
+def test_run_integration_node_waits_for_parents(repo):
+    # running an integration node before its parents finish fails on
+    # eligibility instead of attempting the merge
+    from skein.supervisor import run_node
+    add(repo, "a")
+    add(repo, "b")
+    add(repo, "c", depends=["a", "b"])
+    wt.ensure_integration_node(repo, "c")
+    complete_with_file(repo, "a", "a.txt", "a\n")
+    with pytest.raises(c.ClaimError, match="dependency 'b'"):
+        run_node(repo, "c__integrate", "a1", adapter=object())
+    assert g.load_graph(repo)["c__integrate"]["status"] == "unclaimed"
+
+
+def test_run_integration_node_conflict_reports_files(repo):
+    from skein.supervisor import run_node
+    add(repo, "a")
+    add(repo, "b")
+    add(repo, "c", depends=["a", "b"])
+    wt.ensure_integration_node(repo, "c")
+    complete_with_file(repo, "a", "app.txt", "from-a\n")
+    complete_with_file(repo, "b", "app.txt", "from-b\n")
+    with pytest.raises(RuntimeError, match="app.txt"):
+        run_node(repo, "c__integrate", "a1", adapter=object())
+    assert g.load_graph(repo)["c__integrate"]["status"] == "needs_human"
