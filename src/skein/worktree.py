@@ -202,6 +202,19 @@ def ensure_worktree(repo_root: str | Path, node_id: str,
                     f"different base. Run `skein worktree gc` to remove the "
                     f"stale worktree, or reset the node.")
     else:
+        if _is_sha(base) and len(node.get("depends_on", [])) == 1:
+            # The claim pinned a dependency result commit as the base,
+            # but no worktree exists yet. If the dependency re-ran since
+            # the claim (`skein claim` then `skein run` later), the
+            # pinned SHA is stale: refuse rather than silently build on
+            # the old result.
+            fresh = base_branch_for(repo_root, node_id, nodes)
+            if fresh != base:
+                raise WorktreeError(
+                    f"node '{node_id}' was claimed on base {base[:8]} but "
+                    f"its dependency now records result {fresh[:8]} "
+                    f"(dependency re-ran); release and re-claim the node "
+                    f"to pick up the new base")
         base_sha = _resolve_ref(repo_root, base)
 
     path.parent.mkdir(parents=True, exist_ok=True)

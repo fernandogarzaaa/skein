@@ -281,7 +281,7 @@ def test_doctor_healthy(repo, capsys):
     assert skein_main(["doctor"]) == 0
     out = capsys.readouterr().out
     assert "FAIL" not in out
-    assert out.count("ok  ") == 6
+    assert out.count("ok  ") == 7
 
 
 def test_doctor_bad_config(repo, capsys):

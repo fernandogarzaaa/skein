@@ -59,7 +59,11 @@ This installs the `skein` entrypoint (requires Python ≥ 3.11 and git).
 ## Usage walkthrough
 
 Run inside a git repo (or an empty directory — `skein init` runs
-`git init` for you):
+`git init` for you). `init` also adds `.skein/worktrees/` and
+`.skein/evidence/` to your `.gitignore`: worktrees are nested git
+checkouts and evidence logs are per-run scratch, and neither belongs in
+the control-plane commits (`skein doctor` flags a repo that still tracks
+them):
 
 ```bash
 skein init
@@ -102,10 +106,13 @@ skein release auth-3   # release a claim (only claimed/in-progress nodes)
 # (override the binary with SKEIN_CLAUDE_BIN for testing).
 skein run auth-3 --agent-id agent-1
 
-# inspect history; force-release is explicit, logged, and only for leases
-# held by someone else
+# inspect history; force-release is explicit, logged, and the only way to
+# take a lease held by someone else or to reset a parked node
+# (failed / blocked / needs_human) back to unclaimed
 skein log --node auth-3
 skein release auth-3 --force
+# equivalent reset for a parked node, without the release semantics:
+skein node edit auth-3 --status unclaimed
 
 # ship a done node's result commit to the current branch (idempotent;
 # refuses if the target moved in real files since the result's recorded
@@ -197,6 +204,12 @@ skein plan "Build auth: 1. design schema 2. implement login 3. write tests"
 skein plan --apply          # create nodes from the latest draft
 skein plan --from-git-log   # draft from recent commit subjects
 ```
+
+Drafted nodes carry the task description in `goal`/`context` and an
+**empty `completion`**: the planner cannot know your test command, and
+the verification gate runs `completion` literally, so set one per node
+before running (`skein node edit <id> --completion "pytest tests/x.py"`).
+The draft lists which nodes still need one.
 
 ## Multi-machine sync
 

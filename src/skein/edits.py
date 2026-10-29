@@ -21,9 +21,37 @@ def _check_backend(backend: str, repo_root: Any) -> str:
     return get_profile((backend or "claude_code").strip(), repo_root).name
 
 
+def _check_str_list(value: Any, field: str) -> List[str]:
+    """A list of strings, or ValueError. A bare string is rejected rather
+    than iterated character by character (the web API sends raw JSON)."""
+    if value is None:
+        return []
+    if isinstance(value, str) or not isinstance(value, (list, tuple)):
+        raise ValueError(f"{field} must be a list of strings")
+    for item in value:
+        if not isinstance(item, str):
+            raise ValueError(f"{field} must be a list of strings")
+    return list(value)
+
+
+def _check_backend_config(value: Any) -> Dict[str, str]:
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise ValueError("backend_config must be an object of key=value strings")
+    out: Dict[str, str] = {}
+    for k, v in value.items():
+        if not isinstance(k, str) or not k.strip():
+            raise ValueError("backend_config keys must be non-empty strings")
+        if not isinstance(v, (str, int, float)) or isinstance(v, bool):
+            raise ValueError(f"backend_config['{k}'] must be a string")
+        out[k] = str(v)
+    return out
+
+
 def _check_blast_radius(blast_radius: Optional[List[str]]) -> List[str]:
     out = []
-    for pat in blast_radius or []:
+    for pat in _check_str_list(blast_radius, "blast_radius"):
         if not isinstance(pat, str) or not pat.strip():
             raise ValueError("blast-radius patterns must be non-empty strings")
         if any(ord(ch) < 32 for ch in pat):
@@ -119,7 +147,8 @@ def add_node(repo_root: Any, actor: str, node_id: str, *,
     nodes = g.load_graph(repo_root)
     if node_id in nodes:
         raise ValueError(f"node '{node_id}' already exists")
-    depends_on = list(depends_on or [])
+    depends_on = _check_str_list(depends_on, "depends_on")
+    backend_config = _check_backend_config(backend_config)
     for dep in depends_on:
         ids.validate_node_id(dep)
         if dep not in nodes:
@@ -145,7 +174,7 @@ def add_node(repo_root: Any, actor: str, node_id: str, *,
         "blast_radius": _check_blast_radius(blast_radius),
         "change_policy": change_policy,
         "backend": backend_name,
-        "backend_config": dict(backend_config or {}),
+        "backend_config": backend_config,
         "max_retries": max_retries,
         "retry_backoff_seconds": retry_backoff_seconds,
     })
@@ -168,10 +197,24 @@ def edit_node(repo_root: Any, actor: str, node_id: str,
     if node is None:
         raise ValueError(f"unknown node '{node_id}'")
     fields = dict(fields)
+    if "status" in fields and fields["status"] == node.get("status"):
+        # Re-submitting the current status (the canvas form sends every
+        # field) is not a transition; dropping it keeps "save title" on
+        # a done/claimed node from failing the manual-status check.
+        del fields["status"]
     if "status" in fields:
         _check_status_transition(fields["status"])
+    if "title" in fields and not isinstance(fields["title"], str):
+        raise ValueError("title must be a string")
+    if "intent" in fields:
+        intent = fields["intent"]
+        if not isinstance(intent, dict) or any(
+                not isinstance(v, str) for v in intent.values()):
+            raise ValueError("intent must be an object of string fields")
+    if "backend_config" in fields:
+        fields["backend_config"] = _check_backend_config(fields["backend_config"])
     if "depends_on" in fields:
-        depends_on = list(fields["depends_on"] or [])
+        depends_on = _check_str_list(fields["depends_on"], "depends_on")
         for dep in depends_on:
             ids.validate_node_id(dep)
             if dep not in nodes:

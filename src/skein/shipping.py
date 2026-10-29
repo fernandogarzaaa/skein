@@ -73,10 +73,18 @@ def _conflicted_files(work_dir: str | Path) -> List[str]:
 
 
 def _conflict_message(node_id: str, target: str,
-                      conflicts: List[str]) -> str:
-    files = ", ".join(conflicts) if conflicts else "(unknown files)"
-    return (f"merge of node '{node_id}' result into '{target}' conflicted "
-            f"on: {files}; resolve manually and ship again")
+                      conflicts: List[str], stderr: str = "") -> str:
+    if conflicts:
+        return (f"merge of node '{node_id}' result into '{target}' "
+                f"conflicted on: {', '.join(conflicts)}; resolve manually "
+                f"and ship again")
+    # No unmerged paths: git refused before merging (dirty checkout,
+    # unrelated histories, ...). Pass its reason along instead of a
+    # misleading "(unknown files)".
+    why = (stderr or "").strip().splitlines()
+    detail = why[-1][:200] if why else "git merge failed without a conflict list"
+    return (f"merge of node '{node_id}' result into '{target}' failed: "
+            f"{detail}")
 
 
 def _merge_into(repo_root: str | Path, node_id: str, result_commit: str,
@@ -100,7 +108,8 @@ def _merge_into(repo_root: str | Path, node_id: str, result_commit: str,
         if r.returncode != 0:
             conflicts = _conflicted_files(repo_root)
             _git(repo_root, "merge", "--abort")
-            raise ShipError(_conflict_message(node_id, target, conflicts))
+            raise ShipError(_conflict_message(node_id, target, conflicts,
+                                              r.stderr or r.stdout))
         return _git(repo_root, "rev-parse", "HEAD").stdout.strip()
     tmp = Path(tempfile.mkdtemp(prefix="skein-ship-"))
     try:
@@ -116,7 +125,8 @@ def _merge_into(repo_root: str | Path, node_id: str, result_commit: str,
         if m.returncode != 0:
             conflicts = _conflicted_files(tmp)
             _git(tmp, "merge", "--abort")
-            raise ShipError(_conflict_message(node_id, target, conflicts))
+            raise ShipError(_conflict_message(node_id, target, conflicts,
+                                              m.stderr or m.stdout))
         return _git(tmp, "rev-parse", "HEAD").stdout.strip()
     finally:
         _git(repo_root, "worktree", "remove", "--force", str(tmp))

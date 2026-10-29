@@ -259,11 +259,8 @@ def parse_heuristic(text: str, goal: str = "") -> Dict[str, Any]:
             "id": slugify(single[:120], taken, "task-1"),
             "title": single[:120],
             "goal": goal,
-            "completion": (
-                f"Complete this task: {single}\n\n"
-                f"It is part of the larger goal: {goal}\n\n"
-                "When finished, write a handoff note summarizing what "
-                "changed and how to verify it."),
+            "context": _task_context(single, goal),
+            "completion": "",
             "depends_on": [],
         }
         return _finalize_draft(
@@ -340,14 +337,28 @@ def parse_heuristic(text: str, goal: str = "") -> Dict[str, Any]:
 
     for node in raw_nodes:
         node["goal"] = f"Plan: {goal}\n\nTask: {node['task']}"
-        node["completion"] = (
-            f"Complete this task: {node['task']}\n\n"
-            f"It is part of the larger goal: {goal}\n\n"
-            "When finished, write a handoff note summarizing what changed "
-            "and how to verify it.")
+        node["context"] = _task_context(node["task"], goal)
+        node["completion"] = ""
         del node["task"]
     return _finalize_draft(goal=goal, source="heuristic", brain="heuristic",
                            raw_nodes=raw_nodes, warnings=warnings)
+
+
+def _task_context(task: str, goal: str) -> str:
+    """Agent-facing prose for a planned node. This goes in `context`,
+    never in `completion`: the completion field is the shell command the
+    verification gate executes literally, and a prose sentence there
+    fails every run with "command not found"."""
+    return (f"Complete this task: {task}\n\n"
+            f"It is part of the larger goal: {goal}\n\n"
+            "When finished, write a handoff note summarizing what changed "
+            "and how to verify it.")
+
+
+NO_COMPLETION_WARNING = (
+    "{n} node(s) have no completion command; the verification gate runs "
+    "`completion` literally and an empty one fails, so set one before "
+    "running: skein node edit <id> --completion \"<test command>\"")
 
 
 def _finalize_draft(goal: str, source: str, brain: str,
@@ -359,10 +370,15 @@ def _finalize_draft(goal: str, source: str, brain: str,
             "id": n["id"],
             "title": n["title"],
             "goal": n.get("goal", ""),
+            "context": n.get("context", ""),
             "completion": n.get("completion", ""),
             "depends_on": list(n.get("depends_on", [])),
             "backend": n.get("backend", "claude_code"),
         })
+    warnings = list(warnings)
+    missing = sum(1 for n in nodes if not (n.get("completion") or "").strip())
+    if missing:
+        warnings.append(NO_COMPLETION_WARNING.format(n=missing))
     return {
         "version": DRAFT_VERSION,
         "goal": goal,
@@ -438,6 +454,10 @@ def parse_llm(goal: str, text: str, repo_root: Any) -> Dict[str, Any]:
     if not draft.get("source"):
         draft["source"] = "llm"
     draft.setdefault("warnings", [])
+    missing = sum(1 for n in draft["nodes"]
+                  if not (n.get("completion") or "").strip())
+    if missing:
+        draft["warnings"].append(NO_COMPLETION_WARNING.format(n=missing))
     draft.setdefault("created_at",
                      datetime.now(timezone.utc).isoformat())
     return draft
@@ -481,7 +501,7 @@ def _validate_llm_draft(draft: Any, cmd: str,
             raise PlanError(
                 f"SKEIN_PLANNER_CMD {cmd!r} returned a node with a "
                 "non-string id")
-        for field in ("title", "goal", "completion", "backend"):
+        for field in ("title", "goal", "context", "completion", "backend"):
             if field in n and not isinstance(n[field], str):
                 raise PlanError(
                     f"SKEIN_PLANNER_CMD {cmd!r}: node '{n.get('id')}' "
@@ -557,10 +577,11 @@ def plan_from_git_log(repo_root: Any, max_commits: int = 20) -> Dict[str, Any]:
             "id": nid,
             "title": subject[:120],
             "goal": f"Recreate the change from commit: {subject}",
-            "completion": (
+            "context": (
                 f"Implement the change described by the commit subject: "
                 f"{subject}\n\nWhen finished, write a handoff note "
                 "summarizing what changed and how to verify it."),
+            "completion": "",
             "depends_on": [prev_id] if prev_id else [],
         }
         raw_nodes.append(node)
@@ -704,6 +725,7 @@ def apply_draft(repo_root: Any, actor: str, draft: Dict[str, Any],
             repo_root, actor, node["id"],
             title=node.get("title", "") or node["id"],
             goal=node.get("goal", ""),
+            context=node.get("context", ""),
             completion=node.get("completion", ""),
             depends_on=list(node.get("depends_on", []) or []),
             backend=node.get("backend") or "claude_code",
@@ -745,6 +767,8 @@ def render_draft(draft: Dict[str, Any], path: Optional[str] = None) -> str:
             first = completion[0][:100]
             more = "..." if len(completion) > 1 or len(completion[0]) > 100 else ""
             lines.append(f"    completion: {first}{more}")
+        else:
+            lines.append("    completion: (none - set one before running)")
     lines.append("")
     lines.append("review the draft, then: skein plan --apply"
                  + (f" {path}" if path else ""))

@@ -190,9 +190,25 @@ def _node_html(root: str, node_id: str) -> Optional[bytes]:
         "</td><td>" + html.escape(str(a.get("outcome") or "")) +
         "</td><td>" + html.escape(str(a.get("error") or "")[:200]) + "</td></tr>"
         for a in attempts)
+    # Evidence entries are {command, exit_code, output_ref[, nonce_ok,
+    # aborted, duration_ms]} as written by verify.run_completion and the
+    # supervisor's adapter capture.
+    def _ev_note(e: Dict[str, Any]) -> str:
+        bits = []
+        if e.get("aborted"):
+            bits.append("aborted")
+        if "nonce_ok" in e:
+            bits.append("nonce ok" if e.get("nonce_ok") else "nonce MISSING")
+        if e.get("duration_ms") is not None:
+            bits.append(f"{e.get('duration_ms')} ms")
+        if e.get("error"):
+            bits.append(str(e.get("error"))[:120])
+        return ", ".join(bits)
     ev_rows = "".join(
-        "<tr><td class=\"mono\">" + html.escape(str(e.get("path") or e.get("kind") or "")) +
-        "</td><td>" + html.escape(str(e.get("summary") or "")[:200]) + "</td></tr>"
+        "<tr><td class=\"mono\">" + html.escape(str(e.get("command") or "")[:200]) +
+        "</td><td class=\"mono\">" + html.escape(str(e.get("exit_code", ""))) +
+        "</td><td class=\"mono\">" + html.escape(str(e.get("output_ref") or "-")) +
+        "</td><td>" + html.escape(_ev_note(e)) + "</td></tr>"
         for e in evidence)
     diff_rows = "".join(
         f"<tr><td class=\"mono\">{html.escape(str(path))}</td>"
@@ -205,7 +221,8 @@ def _node_html(root: str, node_id: str) -> Optional[bytes]:
             "<th>ended</th><th>outcome</th><th>error</th></tr>" +
             att_rows + "</table>"
             f"<h2>Evidence ({len(evidence)})</h2>"
-            "<table><tr><th>path</th><th>summary</th></tr>" +
+            "<table><tr><th>command</th><th>exit</th><th>output</th>"
+            "<th>notes</th></tr>" +
             ev_rows + "</table>"
             f"<h2>Diff stats ({len(diff_stats)} files)</h2>"
             "<table><tr><th>file</th><th>added/deleted</th></tr>" +
@@ -539,7 +556,10 @@ class _Handler(BaseHTTPRequestHandler):
                         self._root, node_id, str(body.get("holder") or actor),
                         ttl_seconds=body.get("ttl_seconds"), actor=actor)
                 except c.ClaimError as e:
-                    return self._send(409, {"error": str(e)})
+                    code = 400 if "invalid ttl_seconds" in str(e) else 409
+                    return self._send(code, {"error": str(e)})
+                except ValueError as e:
+                    return self._send(400, {"error": str(e)})
                 return self._send(200, {"node": node})
             if len(parts) == 4 and parts[3] == "release":
                 token = None
@@ -554,7 +574,7 @@ class _Handler(BaseHTTPRequestHandler):
                     node = c.release_node(self._root, node_id, actor=actor,
                                           force=bool(body.get("force", False)),
                                           claim_token=token)
-                except c.ClaimError as e:
+                except (c.ClaimError, ValueError) as e:
                     return self._send(409, {"error": str(e)})
                 return self._send(200, {"node": node})
             if len(parts) == 4 and parts[3] == "ship":

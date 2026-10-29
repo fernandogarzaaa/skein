@@ -43,6 +43,10 @@ input, textarea, select { width: 100%; box-sizing: border-box; }
 <script>
 const COLORS = {unclaimed:"#999", claimed:"#1f77b4", in_progress:"#1f77b4",
   blocked:"#9467bd", needs_human:"#ff7f0e", done:"#2ca02c", failed:"#d62728"};
+// Statuses a human may set directly (graph.MANUAL_STATUSES). done/failed
+// come only from verified runs, claimed/in_progress only from claim; the
+// server rejects them with 400, so the form never offers them.
+const MANUAL_STATUSES = ["unclaimed", "blocked", "needs_human"];
 let NODES = {}, EVENT_COUNT = -1, SELECTED = null, ADDING = false;
 
 // `skein serve --auth-token` gates mutating requests behind a bearer
@@ -148,8 +152,9 @@ function showDetail(id) {
     "<label>Goal <textarea id='f-goal' rows='2'>" + esc(it.goal || "") + "</textarea></label>" +
     "<label>Completion <input id='f-completion' value='" + esc(it.completion || "").replace(/'/g, "&#39;") + "'></label>" +
     "<label>Status <select id='f-status'>" +
-    ["unclaimed","claimed","in_progress","blocked","needs_human","done","failed"].map(s =>
-      "<option value='" + s + "'" + (n.status === s ? " selected" : "") + ">" + s + "</option>").join("") +
+    (MANUAL_STATUSES.includes(n.status) ? [] : [n.status]).concat(MANUAL_STATUSES).map(s =>
+      "<option value='" + esc(s) + "'" + (n.status === s ? " selected" : "") + ">" + esc(s) +
+      (n.status === s ? " (current)" : "") + "</option>").join("") +
     "</select></label>" +
     "<div class='row'><button onclick='saveEdit()'>save</button>" +
     "<button onclick='claimNode()'>claim</button>" +
@@ -164,10 +169,18 @@ function msg(t) { document.getElementById("msg").textContent = t; }
 
 async function saveEdit() {
   try {
-    const r = await api("POST", "/api/nodes/" + encodeURIComponent(SELECTED), {
-      title: val("f-title"),
-      intent: {goal: val("f-goal"), completion: val("f-completion")},
-      status: val("f-status")});
+    // Only send what changed: re-submitting the current status of a
+    // done/claimed node would be rejected as a manual status edit.
+    const n = NODES[SELECTED] || {}, it = n.intent || {};
+    const body = {};
+    if (val("f-title") !== (n.title || "")) body.title = val("f-title");
+    const intent = {};
+    if (val("f-goal") !== (it.goal || "")) intent.goal = val("f-goal");
+    if (val("f-completion") !== (it.completion || "")) intent.completion = val("f-completion");
+    if (Object.keys(intent).length) body.intent = intent;
+    if (val("f-status") !== n.status) body.status = val("f-status");
+    if (!Object.keys(body).length) { msg("nothing changed."); return; }
+    const r = await api("POST", "/api/nodes/" + encodeURIComponent(SELECTED), body);
     await refresh(true);
     msg(r.outcome === "interrupt" ? "human_interrupt recorded; agent claim parked." : "saved.");
   } catch (e) { msg("error: " + e.message); }

@@ -233,8 +233,15 @@ def run_node(repo_root: str | Path, node_id: str, holder: str,
     nodes = g.load_graph(repo_root)
     node = nodes[node_id]
     claim_holder = (node.get("claim") or {}).get("holder")
+    claimed_here = False
     if node["status"] == "unclaimed":
         node = c.claim_node(repo_root, node_id, holder, actor=actor)
+        claimed_here = True
+    elif node["status"] not in ("claimed", "in_progress"):
+        raise c.ClaimError(
+            f"node '{node_id}' is '{node['status']}', not runnable; "
+            f"reset it to unclaimed first (`skein node edit {node_id} "
+            f"--status unclaimed` or `skein release {node_id} --force`)")
     elif claim_holder != holder:
         raise c.ClaimError(f"node '{node_id}' held by '{claim_holder}', not '{holder}'")
 
@@ -249,7 +256,20 @@ def run_node(repo_root: str | Path, node_id: str, holder: str,
                 and cur.get("claim_token") == claim_token
                 and cur.get("holder") == holder)
 
-    path, branch, base = wt.ensure_worktree(repo_root, node_id, actor=actor)
+    try:
+        path, branch, base = wt.ensure_worktree(repo_root, node_id, actor=actor)
+    except wt.WorktreeError as e:
+        # No attempt ran. A claim we just took would otherwise sit on the
+        # node until the lease expires; hand it back with the reason so
+        # the node is immediately re-runnable once the base is fixed.
+        if claimed_here and claim_token:
+            try:
+                c.release_node(repo_root, node_id, actor,
+                               note=f"worktree setup failed: {e}",
+                               claim_token=claim_token)
+            except (c.ClaimError, ValueError):
+                pass
+        raise
     # Durable base of this attempt, captured before the agent runs.
     base_commit = _git_in(path, "rev-parse", "HEAD").stdout.strip()
 
@@ -391,9 +411,18 @@ def run_node(repo_root: str | Path, node_id: str, holder: str,
         try:
             result, warnings = _checkpoint_result(
                 repo_root, path, node_id, attempt_id, base_commit, node, actor)
-        except PolicyViolation as e:
-            c.fail_node(repo_root, node_id, holder, claim_token,
-                        evidence=evidence, error=str(e))
+        except (PolicyViolation, RuntimeError) as e:
+            # PolicyViolation: out-of-scope changes under 'strict'.
+            # RuntimeError: git add/commit failed in the worktree. Either
+            # way the attempt produced no durable result commit, so it is
+            # recorded as failed (retry policy applies) instead of leaving
+            # the node claimed until the lease expires.
+            try:
+                c.fail_node(repo_root, node_id, holder, claim_token,
+                            evidence=evidence, error=str(e))
+            except c.ClaimError:
+                return {"outcome": "superseded", "adapter_exit": adapter_exit,
+                        "node": g.load_graph(repo_root).get(node_id)}
             return {"outcome": "failed", "adapter_exit": adapter_exit,
                     "evidence": evidence,
                     "node": g.load_graph(repo_root).get(node_id)}
