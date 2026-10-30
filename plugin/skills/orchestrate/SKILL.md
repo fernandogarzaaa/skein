@@ -42,11 +42,11 @@ Check the backend profiles first with `skein backends list`. Check the repo with
 ## Pitfalls
 
 - Blast radius matches on the static directory prefix, so `src/a*` and `src/b*` conflict. Give each node its own directory glob, and edit one with `skein node edit <id> --blast-radius ...`. `skein infer-blast <id>` suggests globs but never applies them.
-- `SKEIN_ACTOR` must equal `--agent-id`, or release, run and ship reject the caller as not the holder.
+- Keep `SKEIN_ACTOR` equal to `--agent-id`. `skein run` does not enforce it, but the event log credits actions to `SKEIN_ACTOR`, and `skein release <id>` refuses a caller that is not the holder.
 - Backends receive only `PATH`, `HOME`, `LANG`, `USER`, `LOGNAME` and `SKEIN_*` environment variables. Project secrets from `.envrc` do not reach node agents. Pass what a node needs as `SKEIN_<NAME>` and map it inside the completion command.
-- `skein plan` drafts a DAG from a goal. It does not produce runnable completions, so review the draft and set each `--completion` before `skein plan --apply`.
+- `skein plan` drafts a DAG from a goal. The heuristic planner leaves completions that are not runnable checks. After `skein plan --apply`, set each one with `skein node edit <id> --completion "<check>"` before `skein run`.
 - A fresh worktree has no installed dependencies. Make the completion install them first if the check needs them.
-- Prefer a backend profile with a restricted tool allowlist over one that bypasses permissions. `skein backends list` shows each profile's approval mode. Add a custom restricted one with `skein backends add`.
+- Prefer a backend profile with a restricted tool allowlist over one that bypasses permissions. A node with no `--backend` runs `claude_code`, which skips permission prompts. `skein backends list` shows each profile's invocation, including its approval flags. Add a custom restricted one with `skein backends add`.
 - Files committed to the branch after a node starts do not reach that node's worktree. Put shared config in place before `skein run`.
 
 ## Shared skills

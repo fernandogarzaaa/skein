@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from skein.cli import build_parser
+from skein.graph import VALID_STATUSES
 
 ROOT = Path(__file__).resolve().parent.parent
 PLUGIN = ROOT / "plugin"
@@ -45,6 +46,26 @@ def test_commands_have_description(path):
     assert _frontmatter(path.read_text())["description"].strip()
 
 
+def test_skill_frontmatter():
+    fm = _frontmatter((PLUGIN / "skills" / "orchestrate" / "SKILL.md").read_text())
+    assert fm["name"].strip() == "orchestrate"
+    assert fm["description"].strip()
+
+
+def test_status_command_names_every_skein_status():
+    text = (PLUGIN / "commands" / "status.md").read_text()
+    missing = {s for s in VALID_STATUSES if f"`{s}`" not in text}
+    assert not missing, f"status.md does not cover {sorted(missing)}"
+
+
+def test_dashboard_urls_use_serve_default_port():
+    serve = _subparsers(build_parser())["serve"]
+    port = next(a.default for a in serve._actions if "--port" in a.option_strings)
+    for path in MARKDOWN:
+        for found in re.findall(r"127\.0\.0\.1:(\d+)", path.read_text()):
+            assert int(found) == port, f"{path.name}: port {found}, serve defaults to {port}"
+
+
 def _subparsers(parser):
     for a in parser._actions:
         if isinstance(a, argparse._SubParsersAction):
@@ -61,6 +82,7 @@ def _code_chunks(text):
 
 def _invocations(text):
     for chunk in _code_chunks(text):
+        chunk = re.sub(r"<[^<>]*>", "PLACEHOLDER", chunk)
         for seg in re.split(r"&&|\|\||[|;]|>", chunk):
             toks = seg.split()
             while toks and re.fullmatch(r"[A-Z_]+=\S*", toks[0]):
@@ -72,12 +94,18 @@ def _invocations(text):
 def _validate(toks, where):
     parser = build_parser()
     args = toks[1:]
-    for tok in args:
+    for i, tok in enumerate(args):
         subs = _subparsers(parser)
         if tok.startswith("--"):
             flag = tok.split("=", 1)[0]
-            known = {o for a in parser._actions for o in a.option_strings}
-            assert flag in known, f"{where}: {flag} is not a flag of {parser.prog}"
+            actions = {o: a for a in parser._actions for o in a.option_strings}
+            assert flag in actions, f"{where}: {flag} is not a flag of {parser.prog}"
+            value = tok.split("=", 1)[1] if "=" in tok else (args[i + 1] if i + 1 < len(args) else "")
+            literal = value and not value.startswith(("-", '"', "PLACEHOLDER", "$"))
+            if literal and flag == "--status":
+                assert value in VALID_STATUSES, f"{where}: {value!r} is not a skein status"
+            if literal and actions[flag].choices:
+                assert value in actions[flag].choices, f"{where}: {value!r} is not a choice of {flag}"
         elif subs:
             if tok.startswith("-"):
                 continue
@@ -103,3 +131,12 @@ def test_guard_rejects_fake_flag():
         _validate(["skein", "bogus"], "t")
     with pytest.raises(AssertionError):
         _validate(["skein", "skills", "bogus"], "t")
+    with pytest.raises(AssertionError):
+        _validate(["skein", "node", "edit", "x", "--status", "running"], "t")
+
+
+def test_guard_checks_flags_after_placeholders():
+    text = "`skein node edit <id> --statusx unclaimed`"
+    (toks,) = _invocations(text)
+    with pytest.raises(AssertionError):
+        _validate(toks, "t")

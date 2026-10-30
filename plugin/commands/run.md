@@ -3,16 +3,25 @@ description: Run the skein graph with N parallel agents (default 3) and the live
 argument-hint: "[number of agents]"
 ---
 
-Run the graph with `$ARGUMENTS` agents. If no number is given, use 3.
+Run the graph with `$ARGUMENTS` agents.
 
-1. Run `skein doctor`. Stop and report if it finds problems.
-2. Run `git branch --show-current`. Refuse if it is `main` or `master`; ask the user to switch to a feature branch.
-3. Check whether anything listens on port 8765 (`lsof -i :8765`). If not, start `skein serve --port 8765` in the background.
-4. Start N agents in the background, one process each, for i in 1..N:
+1. Check the agent count. If `$ARGUMENTS` is empty, use 3. If it is not a whole number from 1 to 8, stop and ask the user for one. Above 8, ask for confirmation first.
+2. Run `skein doctor`. Stop and report if it finds problems.
+3. Run `git branch --show-current`. Refuse if the output is empty (detached HEAD), `main` or `master`; ask the user to switch to a feature branch.
+4. List the backend of every node that is not `done`:
 
    ```bash
-   SKEIN_ACTOR=agent-$i skein run --all --agent-id agent-$i > .skein/run-$i.log 2>&1
+   python3 -I -c 'import json; g = json.load(open(".skein/graph.json")); [print(i, n.get("backend") or "claude_code (default)") for i, n in g.items() if n["status"] != "done" and not n.get("removed")]'
    ```
 
-   `SKEIN_ACTOR` must equal `--agent-id`, or release, run and ship reject the agent as not the holder. A single `skein run --all` is sequential, so one process per agent is what gives parallelism. A `skipped: ... held by agent-N` line in a log means that agent lost a claim race, which is harmless.
-5. Report the dashboard URL `http://127.0.0.1:8765/`, and how to watch: `skein status --watch`, `tail -f .skein/run-*.log`, or `skein log --follow`.
+   Compare with `skein backends list`. If any node uses `claude_code` or no backend, warn that this profile skips the coding agent's permission prompts, and ask the user to confirm before starting.
+5. Check for a listener on port 8765 with `lsof -nP -iTCP:8765 -sTCP:LISTEN`. If none, start `skein serve --port 8765` in the background. If something else holds the port, do not start a second dashboard; say what holds it.
+6. Start N agents in the background, one process each, for i in 1..N. Logs go inside the git directory, so skein never commits them:
+
+   ```bash
+   LOGS="$(git rev-parse --git-dir)/skein-logs"; mkdir -p "$LOGS"
+   PYTHONUNBUFFERED=1 SKEIN_ACTOR=agent-$i skein run --all --agent-id agent-$i > "$LOGS/run-$i.log" 2>&1
+   ```
+
+   Keep `SKEIN_ACTOR` equal to `--agent-id`: the event log then credits each claim to its agent, and a later `skein release <id>` from that agent is accepted. A single `skein run --all` is sequential, so one process per agent is what gives parallelism. A `skipped: ... held by agent-N` line means that agent lost a claim race, which is harmless.
+7. Report the dashboard URL `http://127.0.0.1:8765/`, the log directory, and how to watch: `skein status --watch` or `skein log --follow`.

@@ -3,7 +3,13 @@ description: Merge finished skein nodes onto the current feature branch
 argument-hint: "[target branch]"
 ---
 
-1. Run `git branch --show-current`. Refuse if it is `main` or `master`, or if the requested target branch (`$ARGUMENTS`) is.
-2. Run `skein status` and show which nodes are done. If none are done, stop.
-3. Run `skein ship --all`. Only if the user passed a branch in `$ARGUMENTS`, run `skein ship --all --to $ARGUMENTS` instead.
-4. Report what merged and any conflicts, with the node ids involved. Never pass `--force`; on a conflict, stop and ask the user how to proceed.
+skein itself will ship onto any branch, including `main`, so these checks are the only guard.
+
+1. Run `git branch --show-current`. Refuse if the output is empty (detached HEAD), `main` or `master`.
+2. If the user gave a target branch in `$ARGUMENTS`:
+   - Validate it with `git check-ref-format --branch "$ARGUMENTS"`. Refuse if that fails.
+   - Refuse if the name, after removing any leading `refs/heads/` or `<remote>/` part, is `main` or `master`.
+   - Always pass it quoted: `skein ship --all --to "$ARGUMENTS"`.
+3. Run `skein status` and show which nodes are `done` and not yet shipped. If none, stop.
+4. Run `skein ship --all`, or the quoted `--to` form from step 2.
+5. Report what merged and any conflicts, with the node ids involved. Never pass `--force`. On a conflict, stop and ask the user how to proceed.
