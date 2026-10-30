@@ -36,6 +36,8 @@ from skein import worktree as wt
 from skein.cli import main as skein_main
 
 PY = sys.executable
+# Completions run through a shell; quote the interpreter so a path with spaces stays one word.
+PY_SH = f'"{PY}"'
 
 
 def git(repo, *args):
@@ -107,7 +109,7 @@ def test_init_preserves_existing_gitignore(tmp_path, monkeypatch):
 
 def test_run_never_commits_worktree_or_evidence(repo):
     from skein.supervisor import run_node
-    _add("n1", completion=f"{PY} -c \"print('ok')\"")
+    _add("n1", completion=f"{PY_SH} -c \"print('ok')\"")
     result = run_node(repo, "n1", "a1",
                       adapter=FakeAdapter("open('x.txt','w').write('hi')"),
                       heartbeat_interval=0.2, poll_interval=0.05)
@@ -160,7 +162,7 @@ def test_doctor_flags_tracked_scratch_dirs(repo, capsys):
 
 def _fail_node(repo, nid):
     from skein.supervisor import run_node
-    _add(nid, completion=f"{PY} -c \"raise SystemExit(1)\"", max_retries=0)
+    _add(nid, completion=f"{PY_SH} -c \"raise SystemExit(1)\"", max_retries=0)
     r = run_node(repo, nid, "a1", adapter=FakeAdapter("pass"),
                  heartbeat_interval=0.2, poll_interval=0.05)
     assert r["outcome"] == "failed"
@@ -280,7 +282,7 @@ def test_planner_git_log_and_single_node_drafts_have_empty_completion(repo):
 
 def test_edit_drops_unchanged_status(repo):
     from skein.supervisor import run_node
-    _add("e1", completion=f"{PY} -c \"print('ok')\"")
+    _add("e1", completion=f"{PY_SH} -c \"print('ok')\"")
     r = run_node(repo, "e1", "a1", adapter=FakeAdapter("pass"),
                  heartbeat_interval=0.2, poll_interval=0.05)
     assert r["outcome"] == "done"
@@ -317,7 +319,7 @@ def test_canvas_status_select_offers_manual_statuses_only():
 def test_node_page_shows_evidence_commands(repo):
     from skein.serve import _node_html
     from skein.supervisor import run_node
-    _add("p1", completion=f"{PY} -c \"print('ok')\"")
+    _add("p1", completion=f"{PY_SH} -c \"print('ok')\"")
     run_node(repo, "p1", "a1", adapter=FakeAdapter("pass"),
              heartbeat_interval=0.2, poll_interval=0.05)
     page = _node_html(str(repo), "p1").decode()
@@ -363,7 +365,7 @@ def test_cli_run_reports_worktree_error_cleanly(repo, monkeypatch, capsys):
 
 def test_ensure_worktree_refuses_stale_pinned_base(repo):
     from skein.supervisor import run_node
-    _add("dep", completion=f"{PY} -c \"print('ok')\"")
+    _add("dep", completion=f"{PY_SH} -c \"print('ok')\"")
     _add("child", depends_on="dep")
     assert run_node(repo, "dep", "a1", adapter=FakeAdapter("open('a','w').write('1')"),
                     heartbeat_interval=0.2, poll_interval=0.05)["outcome"] == "done"
@@ -384,7 +386,7 @@ def test_ensure_worktree_refuses_stale_pinned_base(repo):
 def test_checkpoint_git_failure_fails_attempt(repo, monkeypatch):
     from skein import supervisor
     from skein.supervisor import run_node
-    _add("g1", completion=f"{PY} -c \"print('ok')\"", max_retries=0)
+    _add("g1", completion=f"{PY_SH} -c \"print('ok')\"", max_retries=0)
 
     def boom(*a, **k):
         raise RuntimeError("result commit failed: disk full")

@@ -23,6 +23,8 @@ from skein import skills as sk
 from skein.cli import main as skein_main
 
 PY = sys.executable
+# Completions run through a shell; quote the interpreter so a path with spaces stays one word.
+PY_SH = f'"{PY}"'
 
 
 def git(repo, *args):
@@ -351,7 +353,7 @@ def test_supervisor_injects_index_into_backend_prompt(repo):
     sk.test(repo, "greet")
     sk.promote(repo, "greet")
     assert skein_main(["node", "add", "n1", "--title", "T", "--goal", "g",
-                       "--completion", f"{PY} -c \"print('ok')\""]) == 0
+                       "--completion", f"{PY_SH} -c \"print('ok')\""]) == 0
     seen = {}
 
     class Capture:
