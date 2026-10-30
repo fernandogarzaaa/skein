@@ -5,10 +5,12 @@ import sys
 from skein import verify as v
 
 PY = sys.executable
+# Completions run through a shell; quote the interpreter so a path with spaces stays one word.
+PY_SH = f'"{PY}"'
 
 
 def test_passing_completion(tmp_path):
-    ok, evidence, _redacted = v.run_completion(tmp_path, f"{PY} -c \"print('hello')\"", tmp_path / "ev", "n1")
+    ok, evidence, _redacted = v.run_completion(tmp_path, f"{PY_SH} -c \"print('hello')\"", tmp_path / "ev", "n1")
     assert ok is True
     assert evidence[0]["exit_code"] == 0
     assert evidence[0]["output_ref"] is not None
@@ -17,7 +19,7 @@ def test_passing_completion(tmp_path):
 
 
 def test_failing_completion_marks_failed(tmp_path):
-    ok, evidence, _redacted = v.run_completion(tmp_path, f"{PY} -c \"raise SystemExit(3)\"", tmp_path / "ev", "n1")
+    ok, evidence, _redacted = v.run_completion(tmp_path, f"{PY_SH} -c \"raise SystemExit(3)\"", tmp_path / "ev", "n1")
     assert ok is False
     assert evidence[0]["exit_code"] == 3
 
@@ -37,7 +39,7 @@ def test_gate_drives_done_failed_transitions(tmp_path):
     from skein import graph as g
     g.append_event(repo, "t", "node_added", "bad", {
         "title": "bad", "intent": {"goal": "g", "context": "", "constraints": "",
-                                   "completion": f"{PY} -c \"raise SystemExit(1)\""},
+                                   "completion": f"{PY_SH} -c \"raise SystemExit(1)\""},
         "depends_on": [], "blast_radius": []})
     g.append_event(repo, "t", "claimed", "bad", {"holder": "h", "ttl_seconds": 60})
     node = g.load_graph(repo)["bad"]
@@ -56,7 +58,7 @@ def test_python_completion_leaves_no_bytecode(tmp_path):
     # and trip the blast-radius change policy).
     (tmp_path / "mod_under_test.py").write_text("X = 1\n")
     ok, _evidence, _redacted = v.run_completion(
-        tmp_path, f"{PY} -c \"import mod_under_test; assert mod_under_test.X == 1\"",
+        tmp_path, f"{PY_SH} -c \"import mod_under_test; assert mod_under_test.X == 1\"",
         tmp_path / "ev", "n1")
     assert ok is True
     assert not (tmp_path / "__pycache__").exists()
@@ -89,9 +91,9 @@ def test_nonce_gate_rejects_early_exit(tmp_path):
     # Plain exit-code gating accepts code that sys.exit(0)s before any
     # assertion; @nonce requires the harness to reach its last line.
     _write_harness(tmp_path, early_exit=True)
-    ok_plain, _, _ = v.run_completion(tmp_path, f"{PY} check.py", tmp_path / "ev", "n1")
+    ok_plain, _, _ = v.run_completion(tmp_path, f"{PY_SH} check.py", tmp_path / "ev", "n1")
     assert ok_plain is True  # documents the weakness @nonce closes
-    ok, evidence, _ = v.run_completion(tmp_path, f"@nonce {PY} check.py", tmp_path / "ev", "n1")
+    ok, evidence, _ = v.run_completion(tmp_path, f"@nonce {PY_SH} check.py", tmp_path / "ev", "n1")
     assert ok is False
     assert evidence[0]["nonce_ok"] is False
 
@@ -99,7 +101,7 @@ def test_nonce_gate_rejects_early_exit(tmp_path):
 def test_nonce_gate_accepts_complete_run_and_hides_nonce(tmp_path):
     import pathlib
     _write_harness(tmp_path, early_exit=False)
-    ok, evidence, _ = v.run_completion(tmp_path, f"@nonce {PY} check.py", tmp_path / "ev", "n1")
+    ok, evidence, _ = v.run_completion(tmp_path, f"@nonce {PY_SH} check.py", tmp_path / "ev", "n1")
     assert ok is True
     assert evidence[0]["nonce_ok"] is True
     assert evidence[0]["command"].startswith("@nonce ")

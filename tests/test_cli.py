@@ -14,6 +14,8 @@ from skein import claim as c
 from skein.cli import main as skein_main
 
 PY = sys.executable
+# Completions run through a shell; quote the interpreter so a path with spaces stays one word.
+PY_SH = f'"{PY}"'
 
 
 @pytest.fixture
@@ -53,7 +55,7 @@ class FakeAdapter:
 
 def test_cli_add_claim_status_log(repo, capsys):
     assert skein_main(["node", "add", "n1", "--title", "T", "--goal", "gg",
-                       "--completion", f"{PY} -c \"print('ok')\""]) == 0
+                       "--completion", f"{PY_SH} -c \"print('ok')\""]) == 0
     assert skein_main(["claim", "n1", "--agent-id", "a1"]) == 0
     assert skein_main(["status"]) == 0
     out = capsys.readouterr().out
@@ -65,7 +67,7 @@ def test_cli_add_claim_status_log(repo, capsys):
 def test_end_to_end_run_real_worktree_branch_evidence(repo):
     from skein.supervisor import run_node
     assert skein_main(["node", "add", "n1", "--title", "T", "--goal", "write file",
-                       "--completion", f"{PY} -c \"import pathlib,sys; sys.exit(0 if pathlib.Path('hello.txt').exists() else 1)\""]) == 0
+                       "--completion", f"{PY_SH} -c \"import pathlib,sys; sys.exit(0 if pathlib.Path('hello.txt').exists() else 1)\""]) == 0
     adapter = FakeAdapter("open('hello.txt','w').write('hi')")
     result = run_node(repo, "n1", "agent-1", adapter=adapter,
                       heartbeat_interval=0.2, poll_interval=0.05)
@@ -82,7 +84,7 @@ def test_run_failing_completion_ends_failed(repo):
     from skein.supervisor import run_node
     assert skein_main(["node", "add", "n2", "--title", "T", "--goal", "g",
                        "--max-retries", "0",
-                       "--completion", f"{PY} -c \"raise SystemExit(1)\""]) == 0
+                       "--completion", f"{PY_SH} -c \"raise SystemExit(1)\""]) == 0
     adapter = FakeAdapter("pass")
     result = run_node(repo, "n2", "agent-1", adapter=adapter,
                       heartbeat_interval=0.2, poll_interval=0.05)
@@ -93,7 +95,7 @@ def test_run_failing_completion_ends_failed(repo):
 def test_human_interrupt_aborts_supervisor(repo):
     from skein.supervisor import run_node
     assert skein_main(["node", "add", "n3", "--title", "T", "--goal", "g",
-                       "--completion", f"{PY} -c \"print('ok')\""]) == 0
+                       "--completion", f"{PY_SH} -c \"print('ok')\""]) == 0
     adapter = FakeAdapter("import time; time.sleep(10)")
     outcome = {}
 

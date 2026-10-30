@@ -32,6 +32,8 @@ from skein import worktree as wt
 from skein.cli import main as skein_main
 
 PY = sys.executable
+# Completions run through a shell; quote the interpreter so a path with spaces stays one word.
+PY_SH = f'"{PY}"'
 
 
 @pytest.fixture
@@ -318,7 +320,7 @@ def test_delete_with_dependents_rejected(repo):
 def test_run_records_durable_result_commit(repo):
     from skein.supervisor import run_node
     assert skein_main(["node", "add", "n1", "--title", "T", "--goal", "write",
-                       "--completion", f"{PY} -c \"import pathlib; raise SystemExit(0 if pathlib.Path('hello.txt').exists() else 1)\""]) == 0
+                       "--completion", f"{PY_SH} -c \"import pathlib; raise SystemExit(0 if pathlib.Path('hello.txt').exists() else 1)\""]) == 0
     adapter = FakeAdapter("open('hello.txt','w').write('hi')")
     result = run_node(repo, "n1", "agent-1", adapter=adapter,
                       heartbeat_interval=0.2, poll_interval=0.05)
@@ -400,7 +402,7 @@ def test_superseded_run_does_not_complete(repo):
 def test_interrupt_during_verification_aborts(repo):
     from skein.supervisor import run_node
     assert skein_main(["node", "add", "n1", "--completion",
-                       f"{PY} -c \"import time; time.sleep(5)\""]) == 0
+                       f"{PY_SH} -c \"import time; time.sleep(5)\""]) == 0
     adapter = FakeAdapter("pass")
     outcome = {}
 
